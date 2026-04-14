@@ -97,6 +97,44 @@ I will write the code for the following custom tools and register them in the `h
 2.  **GitHub Actions Workflows**: Creating the `.github/workflows/reviewer-agent.yml` and `.github/workflows/qa-agent.yml` files.
 3.  **Monitoring Integration**: Connecting Grafana/Prometheus (via MCP) to automatically triage production issues and create new Linear tickets.
 
+## Prerequisite Setup Guide for Linear Integration
+
+To run the Event-Driven architecture in production (Phase 3+), the following setup must be completed within your Linear workspace:
+
+### 1. Generate a Linear API Key
+The agents require an API key to read tickets and perform actions (e.g., updating status, posting comments).
+*   **Recommendation:** Create a dedicated "Bot Account" (e.g., `Hermes AI`) in your Linear workspace and generate a Personal API key from that account. This ensures all agent actions and comments clearly originate from the bot.
+*   **Alternative:** Use a Personal API key from an existing user account (Workspace Settings -> Account -> API).
+
+### 2. Configure Linear Webhooks
+You must configure Linear to send HTTP POST requests to your Production Webhook Server upon ticket changes.
+1. Navigate to **Workspace Settings -> API -> Webhooks**.
+2. Click **New webhook**.
+3. **URL**: Enter the public URL of your webhook server (e.g., `https://api.yourdomain.com/linear-webhook`). *(If testing locally, use a service like `ngrok`.)*
+4. **Events**: To reduce noise, select only the events relevant to the agents:
+    *   `Issue` (Triggered on state changes, creation, assignments)
+    *   `Comment` (Triggered when new comments are posted)
+5. **Secret**: Save the generated Webhook Secret. This is required for your server to verify payload authenticity.
+
+### 3. Create the "Bot Status" Label
+Our concurrency control model relies on a specific label to lock tickets and indicate active agent processing.
+1. Navigate to **Workspace Settings -> Team -> Labels**.
+2. Create a new label named `bot-processing` (or similar) and assign it a distinct color.
+
+### 4. Environment Variables
+Once the setup is complete, provide the following environment variables to your Webhook Server and `hermes-agent` environment:
+
+```env
+# The token the agents use to authenticate with Linear
+LINEAR_API_KEY="lin_api_..."
+
+# The secret the webhook server uses to verify incoming requests
+LINEAR_WEBHOOK_SECRET="wh_sec_..."
+
+# Optional: To ensure the bot doesn't trigger itself endlessly
+LINEAR_BOT_USER_ID="user_id_of_the_bot_account"
+```
+
 ## Verification
 *   **Unit Testing**: Ensure all new tools (Linear, GitHub) have robust test coverage in the `tests/` directory.
 *   **Integration Testing**: Use `pipeline_orchestrator.py` to run a synthetic ticket through the entire lifecycle (Triage -> Develop -> Review -> QA Test -> Deploy) locally. Verify the locking mechanism correctly rejects simultaneous attempts to process the same ticket, and the circuit breaker trips upon endless loop simulation.
