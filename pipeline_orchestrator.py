@@ -4,11 +4,17 @@ Local Pipeline Orchestrator for Multi-Agent SDLC
 
 Simulates the event-driven Linear -> GitHub workflow locally without needing webhooks.
 Runs the Product Manager, Developer, Reviewer, and QA agents sequentially.
+
+Role definitions (prompts, toolsets, shared rules): ``conductor/sdlc_roles.yaml``.
+Override path with env ``SDLC_ROLES_PATH``.
 """
 
-import json
 import logging
-from typing import Any, Dict, List, Tuple
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
 
 from run_agent import AIAgent
 
@@ -84,6 +90,75 @@ def _hermes_model_and_runtime() -> Tuple[str, Dict[str, Any]]:
     return model, rt
 
 
+def _render_template(text: str, ticket_id: str) -> str:
+    return (text or "").replace("{{ticket_id}}", ticket_id)
+
+
+def _default_sdlc_config() -> Dict[str, Any]:
+    """Fallback if conductor/sdlc_roles.yaml is missing or invalid."""
+    return {
+        "common_system": (
+            "You are part of an automated SDLC pipeline. Read tickets and comments first; "
+            "post Linear summaries; escalate to humans when blocked."
+        ),
+        "circuit_breaker_agents": ["Developer", "Reviewer", "QA"],
+        "pipeline": [
+            {
+                "agent_key": "Product Manager",
+                "toolsets": ["linear"],
+                "system": "You are the Product Manager agent. Triage tickets and set priority.",
+                "prompt": "A new ticket {{ticket_id}} has been created.",
+            },
+            {
+                "agent_key": "Developer",
+                "toolsets": ["linear", "github", "terminal", "file"],
+                "system": "You are the Developer agent. Implement the ticket and open a PR.",
+                "prompt": "Ticket {{ticket_id}} is 'In Progress'.",
+            },
+            {
+                "agent_key": "Reviewer",
+                "toolsets": ["linear", "github"],
+                "system": "You are the Reviewer agent. Review the PR and update Linear.",
+                "prompt": "Ticket {{ticket_id}} is 'In Review'.",
+            },
+            {
+                "agent_key": "QA",
+                "toolsets": ["linear", "github", "terminal"],
+                "system": "You are the QA agent. Run tests, merge if appropriate, update Linear.",
+                "prompt": "Ticket {{ticket_id}} is 'Ready For QA'.",
+            },
+        ],
+    }
+
+
+def load_sdlc_config() -> Dict[str, Any]:
+    """Load ``conductor/sdlc_roles.yaml`` (or ``SDLC_ROLES_PATH``)."""
+    override = (os.environ.get("SDLC_ROLES_PATH") or "").strip()
+    if override:
+        path = Path(override).expanduser()
+    else:
+        path = Path(__file__).resolve().parent / "conductor" / "sdlc_roles.yaml"
+    if not path.is_file():
+        logger.warning("SDLC roles file not found at %s — using built-in defaults", path)
+        return _default_sdlc_config()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.error("Failed to load SDLC roles from %s: %s — using defaults", path, exc)
+        return _default_sdlc_config()
+    pipeline = raw.get("pipeline")
+    if not isinstance(pipeline, list) or not pipeline:
+        logger.error("SDLC roles file %s has no pipeline list — using defaults", path)
+        return _default_sdlc_config()
+    for i, step in enumerate(pipeline):
+        if not isinstance(step, dict) or not step.get("agent_key"):
+            logger.error("Invalid pipeline step %s in %s — using defaults", i, path)
+            return _default_sdlc_config()
+    raw["_loaded_from"] = str(path)
+    return raw
+
+
 def check_lock(ticket_id: str, agent_name: str) -> bool:
     """Simulate assignee-based locking."""
     current = DB["locks"].get(ticket_id)
@@ -101,11 +176,21 @@ def release_lock(ticket_id: str, agent_name: str):
         del DB["locks"][ticket_id]
         logger.info(f"Lock released on {ticket_id} by {agent_name}.")
 
-def run_agent(role: str, ticket_id: str, prompt: str, enabled_toolsets: List[str]):
+def run_agent(
+    role: str,
+    ticket_id: str,
+    prompt: str,
+    enabled_toolsets: List[str],
+    *,
+    system_message: str,
+    circuit_breaker_agents: Optional[List[str]] = None,
+    model_override: Optional[str] = None,
+    max_iterations: Optional[int] = None,
+):
     """Run a specific AIAgent profile."""
-    
-    if role in ["Developer", "Reviewer", "QA"]:
-        # Circuit breaker logic
+
+    cb_agents = list(circuit_breaker_agents or ["Developer", "Reviewer", "QA"])
+    if role in cb_agents:
         retries = DB["retries"].get(ticket_id, 0)
         if retries >= 3:
             logger.error(f"🚨 Circuit Breaker Tripped! Max retries (3) reached for {ticket_id}. Halting automation.")
@@ -115,20 +200,12 @@ def run_agent(role: str, ticket_id: str, prompt: str, enabled_toolsets: List[str
         return False
 
     logger.info(f"\n{'='*50}\nStarting {role} Agent for {ticket_id}\n{'='*50}")
-    
-    # We define the system message to enforce the architectural rules
-    system_message = f"""You are the {role} Agent in our SDLC pipeline.
-You must always:
-1. Read the ticket details and historical comments first to gather context.
-2. Execute your specific workflow duties.
-3. If you are the Developer Agent and have tried to fix feedback twice and failed, SURRENDER and tag a human.
-4. When finished, update the ticket status if applicable.
-5. Post a summary comment on the Linear ticket detailing your actions, findings, and blockers.
-"""
 
     model, rt = _hermes_model_and_runtime()
+    if model_override:
+        model = model_override.strip()
     rt = _normalize_minimax_runtime_if_no_anthropic_sdk(rt)
-    agent = AIAgent(
+    agent_kw: Dict[str, Any] = dict(
         model=model,
         api_key=rt.get("api_key"),
         base_url=rt.get("base_url"),
@@ -140,6 +217,9 @@ You must always:
         enabled_toolsets=enabled_toolsets,
         quiet_mode=False,
     )
+    if max_iterations is not None:
+        agent_kw["max_iterations"] = int(max_iterations)
+    agent = AIAgent(**agent_kw)
 
     try:
         response = agent.run_conversation(
@@ -157,51 +237,55 @@ You must always:
 def simulate_pipeline():
     """Simulate the full lifecycle of a dummy ticket."""
     ticket_id = "ENG-42"
-    
-    # 1. Product Manager Agent (Triage)
-    # Trigger: Ticket created
-    pm_success = run_agent(
-        role="Product Manager",
-        ticket_id=ticket_id,
-        prompt=f"A new ticket {ticket_id} has been created. Please read it, assign a priority, move it to 'To-do' or 'In Progress', and post a summary.",
-        enabled_toolsets=["linear"]
-    )
-    
-    # 2. Developer Agent
-    # Trigger: Ticket moved to "In Progress"
-    dev_success = run_agent(
-        role="Developer",
-        ticket_id=ticket_id,
-        prompt=f"Ticket {ticket_id} is 'In Progress'. Please read it, create a branch, write the code, verify the Docker image, open a PR, link it to Linear, move the ticket to 'In Review', and post a summary.",
-        enabled_toolsets=["linear", "github", "terminal", "file"]
-    )
-    
-    # 3. Reviewer Agent
-    # Trigger: Ticket moved to "In Review"
-    review_success = run_agent(
-        role="Reviewer",
-        ticket_id=ticket_id,
-        prompt=f"Ticket {ticket_id} is 'In Review'. Please read the PR diff, review the code, approve the PR, move the ticket to 'Ready For QA', and post a summary.",
-        enabled_toolsets=["linear", "github"]
-    )
-    
-    # 4. QA Agent
-    # Trigger: Ticket moved to "Ready For QA"
-    qa_success = run_agent(
-        role="QA",
-        ticket_id=ticket_id,
-        prompt=f"Ticket {ticket_id} is 'Ready For QA'. Please move the ticket to 'QA Testing', run tests, merge the PR, move the ticket to 'Done', and post a summary.",
-        enabled_toolsets=["linear", "github", "terminal"]
-    )
+    cfg = load_sdlc_config()
+    common = (cfg.get("common_system") or "").strip()
+    cb = cfg.get("circuit_breaker_agents")
+    if not isinstance(cb, list) or not cb:
+        cb = ["Developer", "Reviewer", "QA"]
+    cb = [str(x).strip() for x in cb if str(x).strip()]
 
-    # 5. Simulate a loop rejection (Circuit Breaker Test)
+    for step in cfg["pipeline"]:
+        agent_key = str(step["agent_key"]).strip()
+        toolsets = step.get("toolsets") or []
+        if not isinstance(toolsets, list):
+            toolsets = list(toolsets)
+        role_system = (step.get("system") or "").strip()
+        system_message = f"{common}\n\n{role_system}".strip() if common else role_system
+        prompt = _render_template(str(step.get("prompt") or ""), ticket_id)
+        model_override = step.get("model")
+        if isinstance(model_override, str):
+            model_override = model_override.strip() or None
+        else:
+            model_override = None
+        max_it = step.get("max_iterations")
+        max_iterations = int(max_it) if max_it is not None else None
+        run_agent(
+            agent_key,
+            ticket_id,
+            prompt,
+            toolsets,
+            system_message=system_message,
+            circuit_breaker_agents=cb,
+            model_override=model_override,
+            max_iterations=max_iterations,
+        )
+
+    # Simulate a loop rejection (Circuit Breaker Test)
     logger.info("\n--- Simulating a Circuit Breaker (Retry Loop) ---")
     DB["retries"][ticket_id] = 3
+    dev_step = next((s for s in cfg["pipeline"] if s.get("agent_key") == "Developer"), None)
+    if dev_step:
+        role_system = (dev_step.get("system") or "").strip()
+        system_message = f"{common}\n\n{role_system}".strip() if common else role_system
+    else:
+        system_message = common or "You are the Developer agent."
     run_agent(
-        role="Developer",
-        ticket_id=ticket_id,
-        prompt=f"Ticket {ticket_id} bounced back from QA.",
-        enabled_toolsets=["linear", "github"]
+        "Developer",
+        ticket_id,
+        f"Ticket {ticket_id} bounced back from QA.",
+        ["linear", "github"],
+        system_message=system_message,
+        circuit_breaker_agents=cb,
     )
 
 if __name__ == "__main__":
