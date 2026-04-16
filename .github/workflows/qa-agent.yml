@@ -1,0 +1,59 @@
+name: QA Agent
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'ready-for-qa'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install .[all]
+
+      - name: Run QA Agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
+          HERMES_MODEL: ${{ vars.HERMES_MODEL }}
+        run: |
+          python -c "
+          import os
+          from run_agent import AIAgent
+          from hermes_cli.runtime_provider import resolve_runtime_provider
+          
+          # Use hermes-agent's native resolution
+          rt = resolve_runtime_provider()
+          
+          agent = AIAgent(
+              model=os.getenv('HERMES_MODEL') or rt.get('model') or 'gpt-4o',
+              api_key=os.getenv('HERMES_API_KEY') or rt.get('api_key'),
+              base_url=rt.get('base_url'),
+              provider=rt.get('provider'),
+              api_mode=rt.get('api_mode'),
+              enabled_toolsets=['github', 'linear', 'terminal'],
+              quiet_mode=False,
+          )
+          
+          pr_number = '${{ github.event.pull_request.number }}'
+          repo = '${{ github.repository }}'
+          
+          prompt = f'PR #{pr_number} in {repo} is ready for QA. Please run the integration tests in Docker, verify the build, and post the results. If successful, merge the PR.'
+          system_message = 'You are the QA Agent. Spin up the stack in Docker, run E2E/Integration tests, and provide final approval.'
+          
+          agent.run_conversation(user_message=prompt, system_message=system_message)
+          "

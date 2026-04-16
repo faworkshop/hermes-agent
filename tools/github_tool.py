@@ -1,15 +1,44 @@
 import json
 import logging
 import os
-from typing import Dict, Any
+import requests
+from typing import Dict, Any, Optional, List
 
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
+GITHUB_API_BASE = "https://api.github.com"
+
 def check_github_requirements() -> bool:
     """Check if GitHub integration is configured."""
     return bool(os.getenv("GITHUB_TOKEN"))
+
+def _execute_github_request(method: str, path: str, data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Helper to execute a GitHub REST API request."""
+    token = os.getenv("GITHUB_TOKEN")
+    default_headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json"
+    }
+    if headers:
+        default_headers.update(headers)
+        
+    url = f"{GITHUB_API_BASE}/{path.lstrip('/')}"
+    
+    try:
+        response = requests.request(method, url, headers=default_headers, json=data)
+        response.raise_for_status()
+        
+        # Handle special response formats (like diff)
+        if "application/vnd.github.v3.diff" in default_headers.get("Accept", ""):
+            return {"success": True, "data": response.text}
+            
+        return {"success": True, "data": response.json() if response.text else {}}
+    except Exception as e:
+        logger.error(f"GitHub API Request Failed ({method} {path}): {e}")
+        return {"success": False, "error": str(e)}
 
 # -----------------------------------------------------------------------------
 # Tool Handlers
@@ -17,59 +46,123 @@ def check_github_requirements() -> bool:
 
 def github_create_branch(repo: str, branch_name: str, base_branch: str = "main", task_id: str = None) -> str:
     """Create a new branch in a GitHub repository."""
-    if not check_github_requirements():
-        return json.dumps({"success": False, "error": "GITHUB_TOKEN not set"})
+    # 1. Get the SHA of the base branch
+    ref_res = _execute_github_request("GET", f"repos/{repo}/git/ref/heads/{base_branch}")
+    if not ref_res["success"]:
+        return json.dumps(ref_res)
     
-    # TODO: Implement actual GitHub API call
-    return json.dumps({"success": True, "message": f"Branch {branch_name} created from {base_branch} in {repo}."})
+    sha = ref_res["data"]["object"]["sha"]
+    
+    # 2. Create the new reference
+    payload = {
+        "ref": f"refs/heads/{branch_name}",
+        "sha": sha
+    }
+    result = _execute_github_request("POST", f"repos/{repo}/git/refs", data=payload)
+    return json.dumps(result)
 
 def github_open_pr(repo: str, title: str, head: str, base: str = "main", body: str = "", task_id: str = None) -> str:
     """Open a pull request on GitHub."""
-    if not check_github_requirements():
-        return json.dumps({"success": False, "error": "GITHUB_TOKEN not set"})
-    
-    # TODO: Implement actual GitHub API call
-    return json.dumps({
-        "success": True,
-        "message": f"PR '{title}' created from {head} to {base}.",
-        "data": {"pr_number": 42, "url": f"https://github.com/{repo}/pull/42"}
-    })
+    payload = {
+        "title": title,
+        "head": head,
+        "base": base,
+        "body": body
+    }
+    result = _execute_github_request("POST", f"repos/{repo}/pulls", data=payload)
+    return json.dumps(result)
 
 def github_read_diff(repo: str, pr_number: int, task_id: str = None) -> str:
     """Read the diff of a pull request."""
-    if not check_github_requirements():
-        return json.dumps({"success": False, "error": "GITHUB_TOKEN not set"})
-    
-    # TODO: Implement actual GitHub API call
-    return json.dumps({"success": True, "data": "--- a/file.py\n+++ b/file.py\n@@ -1,1 +1,2 @@\n-old code\n+new code\n+more new code"})
+    headers = {"Accept": "application/vnd.github.v3.diff"}
+    result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}", headers=headers)
+    return json.dumps(result)
 
 def github_resolve_conflict(repo: str, pr_number: int, file_path: str, resolution: str, task_id: str = None) -> str:
-    """Resolve a merge conflict in a PR."""
-    if not check_github_requirements():
-        return json.dumps({"success": False, "error": "GITHUB_TOKEN not set"})
+    """
+    Resolve a merge conflict. In this simplified version, we just update the file on the PR branch.
+    Requires fetching the PR info first to find the branch name.
+    """
+    # 1. Get PR info
+    pr_res = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
+    if not pr_res["success"]: return json.dumps(pr_res)
     
-    # TODO: Implement actual GitHub API call
-    return json.dumps({"success": True, "message": f"Conflict resolved for {file_path} in PR #{pr_number}."})
+    branch = pr_res["data"]["head"]["ref"]
+    
+    # 2. Get file SHA on that branch
+    file_res = _execute_github_request("GET", f"repos/{repo}/contents/{file_path}?ref={branch}")
+    sha = file_res["data"]["sha"] if file_res["success"] else None
+    
+    # 3. Update the file
+    import base64
+    payload = {
+        "message": f"Resolve conflicts in {file_path}",
+        "content": base64.b64encode(resolution.encode()).decode(),
+        "branch": branch
+    }
+    if sha: payload["sha"] = sha
+    
+    result = _execute_github_request("PUT", f"repos/{repo}/contents/{file_path}", data=payload)
+    return json.dumps(result)
 
 def github_assign_pr(repo: str, pr_number: int, assignee: str, task_id: str = None) -> str:
     """Assign a PR to a user."""
-    if not check_github_requirements():
-        return json.dumps({"success": False, "error": "GITHUB_TOKEN not set"})
-    
-    # TODO: Implement actual GitHub API call
-    return json.dumps({"success": True, "message": f"PR #{pr_number} assigned to {assignee}."})
+    payload = {"assignees": [assignee]}
+    result = _execute_github_request("POST", f"repos/{repo}/issues/{pr_number}/assignees", data=payload)
+    return json.dumps(result)
 
 def github_post_review_comment(repo: str, pr_number: int, body: str, commit_id: str = None, path: str = None, line: int = None, task_id: str = None) -> str:
     """Post a review comment on a PR."""
-    if not check_github_requirements():
-        return json.dumps({"success": False, "error": "GITHUB_TOKEN not set"})
+    if commit_id and path and line:
+        # Inline comment
+        payload = {
+            "body": body,
+            "commit_id": commit_id,
+            "path": path,
+            "line": line
+        }
+        result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/comments", data=payload)
+    else:
+        # General PR review/comment
+        payload = {
+            "event": "COMMENT",
+            "body": body
+        }
+        result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/reviews", data=payload)
     
-    # TODO: Implement actual GitHub API call
-    return json.dumps({"success": True, "message": f"Review comment posted to PR #{pr_number}."})
+    return json.dumps(result)
+
+def github_add_label(repo: str, issue_number: int, labels: List[str], task_id: str = None) -> str:
+    \"\"\"Add labels to a PR or Issue. Used by Reviewer to trigger QA.\"\"\"
+    payload = {"labels": labels}
+    result = _execute_github_request("POST", f"repos/{repo}/issues/{issue_number}/labels", data=payload)
+    return json.dumps(result)
 
 # -----------------------------------------------------------------------------
 # Tool Registrations
 # -----------------------------------------------------------------------------
+\"\"\"(rest of existing registrations...)\"\"\"
+
+registry.register(
+    name="github_add_label",
+    toolset="github",
+    schema={
+        "name": "github_add_label",
+        "description": "Add labels to a Pull Request or Issue. Use 'ready-for-qa' to trigger the QA agent.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "issue_number": {"type": "integer", "description": "The PR or Issue number."},
+                "labels": {"type": "array", "items": {"type": "string"}, "description": "List of labels to add."}
+            },
+            "required": ["repo", "issue_number", "labels"]
+        }
+    },
+    handler=lambda args, **kw: github_add_label(args.get("repo", ""), args.get("issue_number", 0), args.get("labels", []), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
 
 registry.register(
     name="github_create_branch",

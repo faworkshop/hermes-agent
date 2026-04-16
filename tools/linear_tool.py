@@ -1,15 +1,39 @@
 import json
 import logging
 import os
-from typing import Dict, Any
+import requests
+from typing import Dict, Any, Optional, List
 
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
+LINEAR_URL = "https://api.linear.app/graphql"
+
 def check_linear_requirements() -> bool:
     """Check if Linear integration is configured."""
     return bool(os.getenv("LINEAR_API_KEY"))
+
+def _execute_linear_query(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Helper to execute a GraphQL query against the Linear API."""
+    api_key = os.getenv("LINEAR_API_KEY")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": api_key
+    }
+    payload = {"query": query, "variables": variables or {}}
+    
+    try:
+        response = requests.post(LINEAR_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        if "errors" in result:
+            logger.error(f"Linear API Errors: {result['errors']}")
+            return {"success": False, "error": result["errors"][0].get("message")}
+        return {"success": True, "data": result.get("data")}
+    except Exception as e:
+        logger.error(f"Linear API Request Failed: {e}")
+        return {"success": False, "error": str(e)}
 
 # -----------------------------------------------------------------------------
 # Tool Handlers
@@ -17,73 +41,170 @@ def check_linear_requirements() -> bool:
 
 def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
     """Read details of a Linear ticket."""
-    if not check_linear_requirements():
-        return json.dumps({"success": False, "error": "LINEAR_API_KEY not set"})
-    
-    # TODO: Implement actual Linear API call
-    return json.dumps({
-        "success": True,
-        "data": {
-            "id": ticket_id,
-            "title": "Example Ticket",
-            "description": "This is a placeholder for the actual Linear ticket.",
-            "state": "In Progress",
-            "priority": 1
+    query = """
+    query Issue($id: String!) {
+      issue(id: $id) {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          id
+          name
         }
-    })
+        assignee {
+          id
+          name
+        }
+        labels {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    }
+    """
+    result = _execute_linear_query(query, {"id": ticket_id})
+    return json.dumps(result)
 
 def linear_read_comments(ticket_id: str, task_id: str = None) -> str:
     """Read comments from a Linear ticket."""
-    if not check_linear_requirements():
-        return json.dumps({"success": False, "error": "LINEAR_API_KEY not set"})
-    
-    # TODO: Implement actual Linear API call
-    return json.dumps({
-        "success": True,
-        "data": [
-            {"body": "This ticket was created automatically.", "user": "System"}
-        ]
-    })
+    query = """
+    query IssueComments($id: String!) {
+      issue(id: $id) {
+        comments {
+          nodes {
+            id
+            body
+            user {
+              name
+            }
+            createdAt
+          }
+        }
+      }
+    }
+    """
+    result = _execute_linear_query(query, {"id": ticket_id})
+    if result["success"]:
+        comments = result["data"]["issue"]["comments"]["nodes"]
+        return json.dumps({"success": True, "data": comments})
+    return json.dumps(result)
 
 def linear_update_status(ticket_id: str, status: str, task_id: str = None) -> str:
-    """Update the status of a Linear ticket."""
-    if not check_linear_requirements():
-        return json.dumps({"success": False, "error": "LINEAR_API_KEY not set"})
+    """Update the status of a Linear ticket by mapping name to stateId."""
+    # 1. Fetch the issue to find its team and available states
+    issue_query = """
+    query IssueTeam($id: String!) {
+      issue(id: $id) {
+        team {
+          states {
+            nodes {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+    """
+    issue_result = _execute_linear_query(issue_query, {"id": ticket_id})
+    if not issue_result["success"]:
+        return json.dumps(issue_result)
     
-    # TODO: Implement actual Linear API call
-    return json.dumps({"success": True, "message": f"Ticket {ticket_id} moved to {status}."})
+    states = issue_result["data"]["issue"]["team"]["states"]["nodes"]
+    state_id = next((s["id"] for s in states if s["name"].lower() == status.lower()), None)
+    
+    if not state_id:
+        return json.dumps({"success": False, "error": f"State '{status}' not found in team workflow."})
+
+    # 2. Update the issue
+    mutation = """
+    mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+      }
+    }
+    """
+    variables = {"id": ticket_id, "input": {"stateId": state_id}}
+    result = _execute_linear_query(mutation, variables)
+    return json.dumps(result)
 
 def linear_update_priority(ticket_id: str, priority: int, task_id: str = None) -> str:
     """Update the priority of a Linear ticket."""
-    if not check_linear_requirements():
-        return json.dumps({"success": False, "error": "LINEAR_API_KEY not set"})
-    
-    # TODO: Implement actual Linear API call
-    return json.dumps({"success": True, "message": f"Ticket {ticket_id} priority set to {priority}."})
+    mutation = """
+    mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+      }
+    }
+    """
+    variables = {"id": ticket_id, "input": {"priority": priority}}
+    result = _execute_linear_query(mutation, variables)
+    return json.dumps(result)
 
 def linear_assign_user(ticket_id: str, user_id: str, task_id: str = None) -> str:
     """Assign a Linear ticket to a user."""
-    if not check_linear_requirements():
-        return json.dumps({"success": False, "error": "LINEAR_API_KEY not set"})
-    
-    # TODO: Implement actual Linear API call
-    return json.dumps({"success": True, "message": f"Ticket {ticket_id} assigned to {user_id}."})
+    mutation = """
+    mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+      }
+    }
+    """
+    variables = {"id": ticket_id, "input": {"assigneeId": user_id}}
+    result = _execute_linear_query(mutation, variables)
+    return json.dumps(result)
 
 def linear_add_label(ticket_id: str, label_id: str, task_id: str = None) -> str:
-    """Add a label to a Linear ticket."""
-    if not check_linear_requirements():
-        return json.dumps({"success": False, "error": "LINEAR_API_KEY not set"})
+    """Add a label to a Linear ticket. Supports label name or ID."""
+    # First, get current labels to avoid overwriting or to find ID by name
+    query = """
+    query IssueLabels($id: String!) {
+      issue(id: $id) {
+        labels { nodes { id } }
+        team { labels { nodes { id name } } }
+      }
+    }
+    """
+    info = _execute_linear_query(query, {"id": ticket_id})
+    if not info["success"]: return json.dumps(info)
     
-    # TODO: Implement actual Linear API call
-    return json.dumps({"success": True, "message": f"Added label {label_id} to ticket {ticket_id}."})
+    current_ids = [l["id"] for l in info["data"]["issue"]["labels"]["nodes"]]
+    team_labels = info["data"]["issue"]["team"]["labels"]["nodes"]
+    
+    # Resolve label_id if it's a name
+    target_id = label_id
+    for l in team_labels:
+        if l["name"].lower() == label_id.lower() or l["id"] == label_id:
+            target_id = l["id"]
+            break
+            
+    if target_id not in current_ids:
+        current_ids.append(target_id)
+        
+    mutation = """
+    mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }
+    """
+    return json.dumps(_execute_linear_query(mutation, {"id": ticket_id, "input": {"labelIds": current_ids}}))
 
 def linear_post_comment(ticket_id: str, body: str, task_id: str = None) -> str:
     """Post a comment to a Linear ticket."""
-    if not check_linear_requirements():
-        return json.dumps({"success": False, "error": "LINEAR_API_KEY not set"})
-    
-    # TODO: Implement actual Linear API call
-    return json.dumps({"success": True, "message": f"Comment posted on ticket {ticket_id}."})
+    mutation = """
+    mutation CommentCreate($input: CommentCreateInput!) {
+      commentCreate(input: $input) {
+        success
+        comment { id }
+      }
+    }
+    """
+    variables = {"input": {"issueId": ticket_id, "body": body}}
+    result = _execute_linear_query(mutation, variables)
+    return json.dumps(result)
 
 # -----------------------------------------------------------------------------
 # Tool Registrations
