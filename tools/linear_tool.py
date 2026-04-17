@@ -206,9 +206,94 @@ def linear_post_comment(ticket_id: str, body: str, task_id: str = None) -> str:
     result = _execute_linear_query(mutation, variables)
     return json.dumps(result)
 
+def linear_search_tickets(query_string: str = "", state_name: str = "", limit: int = 10, task_id: str = None) -> str:
+    """Search for tickets in Linear to understand dependencies and current work."""
+    # Linear's issueSearch or simple issues query with filters
+    # For simplicity, we'll query issues with an optional state filter
+    query = """
+    query Issues($first: Int!) {
+      issues(first: $first, orderBy: updatedAt) {
+        nodes {
+          identifier
+          title
+          priority
+          state { name }
+          project { name }
+        }
+      }
+    }
+    """
+    # Note: A real implementation would use advanced filters based on `query_string` and `state_name`
+    # This provides a basic overview of recent/active issues
+    result = _execute_linear_query(query, {"first": limit})
+    if result.get("success"):
+        issues = result["data"]["issues"]["nodes"]
+        if state_name:
+            issues = [i for i in issues if i.get("state", {}).get("name", "").lower() == state_name.lower()]
+        if query_string:
+            issues = [i for i in issues if query_string.lower() in i.get("title", "").lower() or query_string.lower() in i.get("identifier", "").lower()]
+        return json.dumps({"success": True, "data": issues})
+    return json.dumps(result)
+
+def linear_get_projects(limit: int = 5, task_id: str = None) -> str:
+    """Get active projects and roadmap context."""
+    query = """
+    query Projects($first: Int!) {
+      projects(first: $first, filter: { state: { in: ["started", "planned", "backlog"] } }) {
+        nodes {
+          name
+          description
+          state
+          progress
+          targetDate
+        }
+      }
+    }
+    """
+    result = _execute_linear_query(query, {"first": limit})
+    return json.dumps(result)
+
 # -----------------------------------------------------------------------------
 # Tool Registrations
 # -----------------------------------------------------------------------------
+
+registry.register(
+    name="linear_search_tickets",
+    toolset="linear",
+    schema={
+        "name": "linear_search_tickets",
+        "description": "Search for other tickets to understand dependencies, backlog, or in-progress work.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query_string": {"type": "string", "description": "Optional keyword to search in title or ID."},
+                "state_name": {"type": "string", "description": "Optional state to filter by (e.g., 'Backlog', 'In Progress')."},
+                "limit": {"type": "integer", "description": "Max number of tickets to return (default 10)."}
+            }
+        }
+    },
+    handler=lambda args, **kw: linear_search_tickets(args.get("query_string", ""), args.get("state_name", ""), args.get("limit", 10), kw.get("task_id")),
+    check_fn=check_linear_requirements,
+    requires_env=["LINEAR_API_KEY"],
+)
+
+registry.register(
+    name="linear_get_projects",
+    toolset="linear",
+    schema={
+        "name": "linear_get_projects",
+        "description": "Get active projects and their progress to understand the roadmap and strategic priorities.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max number of projects to return (default 5)."}
+            }
+        }
+    },
+    handler=lambda args, **kw: linear_get_projects(args.get("limit", 5), kw.get("task_id")),
+    check_fn=check_linear_requirements,
+    requires_env=["LINEAR_API_KEY"],
+)
 
 registry.register(
     name="linear_read_ticket",
