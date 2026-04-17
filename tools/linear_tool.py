@@ -354,7 +354,7 @@ registry.register(
                 },
                 "status": {
                     "type": "string",
-                    "description": "The new status (e.g., 'To-do', 'In Progress', 'In Review', 'Ready For QA', 'QA Testing', 'Ready For Delivery', 'Done')."
+                    "description": "The new status (e.g., 'Todo', 'In Progress', 'In Review', 'Ready For QA', 'QA Testing', 'Ready For Delivery', 'Done')."
                 }
             },
             "required": ["ticket_id", "status"]

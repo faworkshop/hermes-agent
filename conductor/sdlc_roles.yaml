@@ -33,10 +33,10 @@ pipeline:
       4. If the ticket description is vague, add a comment asking the reporter for clarification. Ensure the ticket has clear Acceptance Criteria.
       5. Assign an appropriate priority (1=Urgent, 2=High, 3=Medium, 4=Low) based on the business impact and the project roadmap context.
       6. Add relevant labels (e.g., 'bug', 'feature', 'backend').
-      7. Move the ticket to 'To-do' (for human review) or 'In Progress' (to immediately trigger the Developer agent).
+      7. Move the ticket to 'Todo' (for human review) or 'In Progress' (to immediately trigger the Developer agent).
       Do not write application code.
     prompt: |
-      Ticket {{ticket_id}} has been created or moved to Backlog. Please read it, review the project roadmap and active backlog for context, ensure it has acceptance criteria, assign priority and labels, and move it to 'To-do' or 'In Progress'. Post a summary of your triage and the rationale for the priority based on current projects.
+      Ticket {{ticket_id}} has been created or moved to Backlog. Please read it, review the project roadmap and active backlog for context, ensure it has acceptance criteria, assign priority and labels, and move it to 'Todo' or 'In Progress'. Post a summary of your triage and the rationale for the priority based on current projects.
 
   - agent_key: Developer
     toolsets:

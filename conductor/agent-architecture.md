@@ -5,9 +5,9 @@ The goal is to leverage the `hermes-agent` framework to build a multi-agent syst
 
 ## Scope & Impact
 This architecture will introduce four specialized AI agents that map directly to the Linear ticket workflow:
-`New / Backlog -> To-do -> In Progress -> In Review -> Ready For QA -> QA Testing -> Ready For Delivery -> Done`
+`New / Backlog -> Todo -> In Progress -> In Review -> Ready For QA -> QA Testing -> Ready For Delivery -> Done`
 
-1.  **Product Manager Agent**: Responsible for monitoring new or unassigned tickets, analyzing their content, assigning priority, breaking them down if necessary, and delegating them to the "To-do" or "In Progress" pipeline.
+1.  **Product Manager Agent**: Responsible for monitoring new or unassigned tickets, analyzing their content, assigning priority, breaking them down if necessary, and delegating them to the "Todo" or "In Progress" pipeline.
 2.  **Developer Agent**: Responsible for reading Linear tickets, writing code in a local Docker environment, running unit tests, verifying Docker images, opening Pull Requests on GitHub, and resolving feedback/conflicts from Reviewer and QA agents.
 3.  **Reviewer Agent**: Responsible for reviewing code changes in PRs against best practices, the original ticket requirements, and QA testing results.
 4.  **QA Agent**: Responsible for running comprehensive test suites within Docker, verifying the build/deployment, reporting issues back to the Developer, and providing final approval before merge/deployment.
@@ -27,7 +27,7 @@ The core philosophy is that agents should be ephemeral and triggered by the tool
 1.  **Product Manager Agent**:
     *   **Trigger**: Linear Webhook (Ticket created or moved to "Backlog" / "New").
     *   **Tools**: `linear_tools` (read tickets, read comments, update priority, assign users, update status, post summary comments).
-    *   **Workflow**: Reads the new ticket and comments -> Analyzes technical feasibility and business priority -> Updates the ticket with clarification or extra details -> Assigns a priority -> Delegates the ticket by moving it to **"To-do"** (for human review) or directly to **"In Progress"** (for immediate automated pickup) -> Posts summary comment.
+    *   **Workflow**: Reads the new ticket and comments -> Analyzes technical feasibility and business priority -> Updates the ticket with clarification or extra details -> Assigns a priority -> Delegates the ticket by moving it to **"Todo"** (for human review) or directly to **"In Progress"** (for immediate automated pickup) -> Posts summary comment.
 
 2.  **Developer Agent**:
     *   **Trigger**: Linear Webhook (Ticket moved to "In Progress") or GitHub Webhook ("Changes Requested" by Reviewer/QA).
@@ -87,7 +87,7 @@ Once this plan is approved, I will immediately begin implementing **Phase 1** an
 
 ### Phase 1: Tool Integration (Immediate Action)
 I will write the code for the following custom tools and register them in the `hermes-agent` registry:
-1.  **Linear Tools** (`tools/linear_tool.py`): Implement tools to interact with the Linear API to read ticket details, **read ticket comments**, transition states (New, To-do, In Progress, In Review, Ready For QA, QA Testing, Ready For Delivery, Done, Blocked), assign priority, assign users (for locking), add labels (for locking and `needs-human`), and **post summary comments**.
+1.  **Linear Tools** (`tools/linear_tool.py`): Implement tools to interact with the Linear API to read ticket details, **read ticket comments**, transition states (New, Todo, In Progress, In Review, Ready For QA, QA Testing, Ready For Delivery, Done, Blocked), assign priority, assign users (for locking), add labels (for locking and `needs-human`), and **post summary comments**.
 2.  **GitHub Tools** (`tools/github_tool.py`): Implement tools to interact with the GitHub API for creating branches, opening PRs, reading diffs, resolving conflicts, assigning PRs (for locking), and leaving review comments.
 
 ### Phase 2: Agent Configuration & Local Orchestration (Immediate Action)
