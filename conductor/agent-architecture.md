@@ -87,7 +87,7 @@ Once this plan is approved, I will immediately begin implementing **Phase 1** an
 
 ### Phase 1: Tool Integration (Immediate Action)
 I will write the code for the following custom tools and register them in the `hermes-agent` registry:
-1.  **Linear Tools** (`tools/linear_tool.py`): Implement tools to interact with the Linear API to read ticket details, **read ticket comments**, transition states (New, Todo, In Progress, In Review, Ready For QA, QA Testing, Ready For Delivery, Done, Blocked), assign priority, assign users (for locking), add labels (for locking and `needs-human`), and **post summary comments**.
+1.  **Linear Tools** (`tools/linear_tool.py`): Implement tools to interact with the Linear API to read ticket details, **read ticket comments**, transition states (New, Todo, In Progress, In Review, Ready For QA, QA Testing, Ready For Delivery, Blocked), assign priority, assign users (for locking), add labels (for locking and `needs-human`), and **post summary comments**.
 2.  **GitHub Tools** (`tools/github_tool.py`): Implement tools to interact with the GitHub API for creating branches, opening PRs, reading diffs, resolving conflicts, assigning PRs (for locking), and leaving review comments.
 
 ### Phase 2: Agent Configuration & Local Orchestration (Immediate Action)
@@ -144,7 +144,7 @@ LINEAR_BOT_USER_ID="user_id_of_the_bot_account"
 ## Verification
 *   **Unit Testing**: Ensure all new tools (Linear, GitHub) have robust test coverage in the `tests/` directory.
 *   **Integration Testing**: Use `pipeline_orchestrator.py` to run a synthetic ticket through the entire lifecycle (Triage -> Develop -> Review -> QA Test -> Deploy) locally. Verify the locking mechanism correctly rejects simultaneous attempts to process the same ticket, and the circuit breaker trips upon endless loop simulation.
-*   **End-to-End Testing**: Once Phase 3 is deployed, verify the Webhook server coordinates all four agents through all states from "New" to "Done".
+*   **End-to-End Testing**: Once Phase 3 is deployed, verify the Webhook server coordinates all four agents through all states from "New" to "Ready For Delivery".
 
 ## Migration & Rollback
 *   Since this architecture is event-driven and supplementary to human development, it can be rolled back simply by disabling the Linear webhooks and GitHub Actions. No permanent changes are made to the core repository structure other than adding the tool integrations.

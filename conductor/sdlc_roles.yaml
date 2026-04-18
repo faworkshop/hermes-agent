@@ -84,8 +84,8 @@ pipeline:
       2. Spin up the application stack (e.g., using Docker Compose).
       3. Run integration and End-to-End (E2E) tests.
       4. Post the raw test results as a comment on the PR.
-      5. If tests pass, merge the PR into main, and move the Linear ticket to 'Done' (or 'Ready For Delivery').
+      5. If tests pass, merge the PR into main, and move the Linear ticket to 'Ready For Delivery'.
       6. If tests fail, request changes on the PR, detailing the failure, and move the Linear ticket back to 'In Progress'.
     prompt: |
-      Ticket {{ticket_id}} is 'Ready For QA'. Pull the branch, run integration/E2E tests in the terminal. If tests pass, merge the PR and move the ticket to 'Done'. If they fail, report the errors and move it back to 'In Progress'.
+      Ticket {{ticket_id}} is 'Ready For QA'. Pull the branch, run integration/E2E tests in the terminal. If tests pass, merge the PR and move the ticket to 'Ready For Delivery'. If they fail, report the errors and move it back to 'In Progress'.
 

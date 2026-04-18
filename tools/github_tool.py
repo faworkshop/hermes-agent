@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import requests
+import base64
 from typing import Dict, Any, Optional, List
 
 from tools.registry import registry
@@ -94,7 +95,6 @@ def github_resolve_conflict(repo: str, pr_number: int, file_path: str, resolutio
     sha = file_res["data"]["sha"] if file_res["success"] else None
     
     # 3. Update the file
-    import base64
     payload = {
         "message": f"Resolve conflicts in {file_path}",
         "content": base64.b64encode(resolution.encode()).decode(),
@@ -133,7 +133,7 @@ def github_post_review_comment(repo: str, pr_number: int, body: str, commit_id: 
     return json.dumps(result)
 
 def github_add_label(repo: str, issue_number: int, labels: List[str], task_id: str = None) -> str:
-    \"\"\"Add labels to a PR or Issue. Used by Reviewer to trigger QA.\"\"\"
+    """Add labels to a PR or Issue. Used by Reviewer to trigger QA."""
     payload = {"labels": labels}
     result = _execute_github_request("POST", f"repos/{repo}/issues/{issue_number}/labels", data=payload)
     return json.dumps(result)
@@ -141,28 +141,6 @@ def github_add_label(repo: str, issue_number: int, labels: List[str], task_id: s
 # -----------------------------------------------------------------------------
 # Tool Registrations
 # -----------------------------------------------------------------------------
-\"\"\"(rest of existing registrations...)\"\"\"
-
-registry.register(
-    name="github_add_label",
-    toolset="github",
-    schema={
-        "name": "github_add_label",
-        "description": "Add labels to a Pull Request or Issue. Use 'ready-for-qa' to trigger the QA agent.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "repo": {"type": "string", "description": "Repository in format owner/repo."},
-                "issue_number": {"type": "integer", "description": "The PR or Issue number."},
-                "labels": {"type": "array", "items": {"type": "string"}, "description": "List of labels to add."}
-            },
-            "required": ["repo", "issue_number", "labels"]
-        }
-    },
-    handler=lambda args, **kw: github_add_label(args.get("repo", ""), args.get("issue_number", 0), args.get("labels", []), kw.get("task_id")),
-    check_fn=check_github_requirements,
-    requires_env=["GITHUB_TOKEN"],
-)
 
 registry.register(
     name="github_create_branch",
@@ -291,6 +269,27 @@ registry.register(
         }
     },
     handler=lambda args, **kw: github_post_review_comment(args.get("repo", ""), args.get("pr_number", 0), args.get("body", ""), args.get("commit_id"), args.get("path"), args.get("line"), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
+registry.register(
+    name="github_add_label",
+    toolset="github",
+    schema={
+        "name": "github_add_label",
+        "description": "Add labels to a Pull Request or Issue. Use 'ready-for-qa' to trigger the QA agent.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "issue_number": {"type": "integer", "description": "The PR or Issue number."},
+                "labels": {"type": "array", "items": {"type": "string"}, "description": "List of labels to add."}
+            },
+            "required": ["repo", "issue_number", "labels"]
+        }
+    },
+    handler=lambda args, **kw: github_add_label(args.get("repo", ""), args.get("issue_number", 0), args.get("labels", []), kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
 )
