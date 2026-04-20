@@ -129,7 +129,30 @@ def github_post_review_comment(repo: str, pr_number: int, body: str, commit_id: 
             "body": body
         }
         result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/reviews", data=payload)
-    
+
+    return json.dumps(result)
+
+
+def github_approve_pr(repo: str, pr_number: int, body: str = "", task_id: str = None) -> str:
+    """Approve a Pull Request."""
+    payload = {
+        "event": "APPROVE",
+        "body": body or "Code review approved. Ready for QA."
+    }
+    result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/reviews", data=payload)
+    return json.dumps(result)
+
+
+def github_merge_pr(repo: str, pr_number: int, task_id: str = None) -> str:
+    """Merge a Pull Request into its base branch."""
+    payload = {"merge_method": "merge"}
+    result = _execute_github_request("PUT", f"repos/{repo}/pulls/{pr_number}/merge", data=payload)
+    return json.dumps(result)
+
+
+def github_get_pr(repo: str, pr_number: int, task_id: str = None) -> str:
+    """Get full details of a Pull Request including head/base branch info."""
+    result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
     return json.dumps(result)
 
 def github_add_label(repo: str, issue_number: int, labels: List[str], task_id: str = None) -> str:
@@ -269,6 +292,67 @@ registry.register(
         }
     },
     handler=lambda args, **kw: github_post_review_comment(args.get("repo", ""), args.get("pr_number", 0), args.get("body", ""), args.get("commit_id"), args.get("path"), args.get("line"), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
+registry.register(
+    name="github_approve_pr",
+    toolset="github",
+    schema={
+        "name": "github_approve_pr",
+        "description": "Approve a Pull Request. Required before the QA agent can merge.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "pr_number": {"type": "integer", "description": "The PR number to approve."},
+                "body": {"type": "string", "description": "Optional review body message."}
+            },
+            "required": ["repo", "pr_number"]
+        }
+    },
+    handler=lambda args, **kw: github_approve_pr(args.get("repo", ""), args.get("pr_number", 0), args.get("body", ""), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
+registry.register(
+    name="github_merge_pr",
+    toolset="github",
+    schema={
+        "name": "github_merge_pr",
+        "description": "Merge a Pull Request into its base branch. Only call this after QA has verified the PR.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "pr_number": {"type": "integer", "description": "The PR number to merge."}
+            },
+            "required": ["repo", "pr_number"]
+        }
+    },
+    handler=lambda args, **kw: github_merge_pr(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
+registry.register(
+    name="github_get_pr",
+    toolset="github",
+    schema={
+        "name": "github_get_pr",
+        "description": "Get full details of a Pull Request including base/head branch, mergeability, and state.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "pr_number": {"type": "integer", "description": "The PR number."}
+            },
+            "required": ["repo", "pr_number"]
+        }
+    },
+    handler=lambda args, **kw: github_get_pr(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
 )

@@ -57,6 +57,16 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
           id
           name
         }
+        team {
+          id
+          name
+          key
+        }
+        project {
+          id
+          name
+          slug
+        }
         labels {
           nodes {
             id
@@ -68,6 +78,8 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
           title
           url
           state
+          baseRefName
+          headRefName
         }
         attachments {
           nodes {
@@ -75,6 +87,14 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
             title
             url
             contentType
+          }
+        }
+        comments {
+          nodes {
+            id
+            body
+            user { name }
+            createdAt
           }
         }
       }
@@ -314,7 +334,7 @@ registry.register(
     toolset="linear",
     schema={
         "name": "linear_read_ticket",
-        "description": "Read details of a Linear ticket. Use this to understand the task.",
+        "description": "Read full details of a Linear ticket including team/project context, pullRequest with base/head branches, attachments (PR URLs), and recent comments. Use this as the first step to gather all context about a ticket.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -462,7 +482,7 @@ registry.register(
     toolset="linear",
     schema={
         "name": "linear_post_comment",
-        "description": "Post a summary comment to a Linear ticket detailing actions, findings, and blockers.",
+        "description": "Post a comment to a Linear ticket. Always include a clear summary of what you did, what you found, and what the next steps are. Use this to keep a record of agent actions.",
         "parameters": {
             "type": "object",
             "properties": {
