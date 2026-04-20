@@ -2675,6 +2675,9 @@ class GatewayRunner:
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
+        if canonical == "dashboard":
+            return await self._handle_dashboard_command(event)
+
         if canonical == "status":
             return await self._handle_status_command(event)
 
@@ -4097,17 +4100,55 @@ class GatewayRunner:
         ]
         if title:
             lines.append(f"**Title:** {title}")
-        lines.extend([
-            f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Tokens:** {session_entry.total_tokens:,}",
-            f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
-            "",
-            f"**Connected Platforms:** {', '.join(connected_platforms)}",
-        ])
+        lines.extend(
+            [
+                f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
+                f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
+                f"**Tokens:** {session_entry.total_tokens:,}",
+                f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
+                "",
+                f"**Connected Platforms:** {', '.join(connected_platforms)}",
+            ]
+        )
 
         return "\n".join(lines)
-    
+
+    async def _handle_dashboard_command(self, event: MessageEvent) -> str:
+        """Handle /dashboard command — show all active agent locks and ticket statuses."""
+        from agent.concurrency import ConcurrencyManager
+        import time
+
+        cm = ConcurrencyManager()
+        rows = cm.get_all_locks()
+
+        if not rows:
+            return "📊 **Agent Dashboard**\n\nNo active agent locks. All tickets are free."
+
+        lines = ["📊 **Agent Dashboard**\n"]
+        now = time.time()
+
+        # Group by assignee (role)
+        by_role: dict[str, list[tuple]] = {}
+        for ticket_id, assignee, locked_at in rows:
+            by_role.setdefault(assignee, []).append((ticket_id, locked_at))
+
+        for role, tickets in sorted(by_role.items()):
+            lines.append(f"**{role}** ({len(tickets)} active)")
+            for ticket_id, locked_at in tickets:
+                age_secs = now - locked_at
+                age_mins = age_secs / 60
+                age_str = f"{age_mins:.1f}m ago" if age_mins < 60 else f"{age_mins/60:.1f}h ago"
+                if age_secs > 1800:
+                    lines.append(f"  🔴 STALE `{ticket_id}` — locked {age_str} ⚠️ (auto-expires at 30m)")
+                elif age_secs > 1200:
+                    lines.append(f"  🟡 Aging `{ticket_id}` — locked {age_str}")
+                else:
+                    lines.append(f"  🔒 `{ticket_id}` — locked {age_str}")
+            lines.append("")
+
+        lines.append("Locks auto-expire after 30 minutes of inactivity.")
+        return "\n".join(lines)
+
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
 

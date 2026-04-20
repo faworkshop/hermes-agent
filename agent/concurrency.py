@@ -28,20 +28,30 @@ class ConcurrencyManager:
             """)
             conn.commit()
 
-    def acquire_lock(self, ticket_id: str, agent_name: str) -> bool:
-        """Try to acquire a lock for a ticket."""
+    def acquire_lock(self, ticket_id: str, agent_name: str, timeout: float = 1800.0) -> bool:
+        """Try to acquire a lock for a ticket. Stale locks (older than `timeout` seconds) are auto-expired."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT assignee FROM locks WHERE ticket_id = ?", (ticket_id,))
+            cursor.execute("SELECT assignee, locked_at FROM locks WHERE ticket_id = ?", (ticket_id,))
             row = cursor.fetchone()
-            
+
             if row:
-                current_assignee = row[0]
-                if current_assignee == agent_name:
-                    return True
-                logger.warning(f"Ticket {ticket_id} is already locked by {current_assignee}")
-                return False
-            
+                current_assignee, locked_at = row[0], row[1]
+                age = time.time() - locked_at
+                if age > timeout:
+                    # Stale lock — expire it and proceed to acquire
+                    logger.info(
+                        f"Ticket {ticket_id} lock by {current_assignee} is stale "
+                        f"({age:.0f}s old, max {timeout}s). Expiring and re-acquiring."
+                    )
+                    conn.execute("DELETE FROM locks WHERE ticket_id = ?", (ticket_id,))
+                    conn.commit()
+                else:
+                    if current_assignee == agent_name:
+                        return True
+                    logger.warning(f"Ticket {ticket_id} is already locked by {current_assignee} ({age:.0f}s old)")
+                    return False
+
             cursor.execute(
                 "INSERT INTO locks (ticket_id, assignee, locked_at) VALUES (?, ?, ?)",
                 (ticket_id, agent_name, time.time())
@@ -88,3 +98,18 @@ class ConcurrencyManager:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM retries WHERE ticket_id = ?", (ticket_id,))
             conn.commit()
+
+    def get_all_locks(self) -> list[tuple[str, str, float]]:
+        """Return all active locks as (ticket_id, assignee, locked_at) tuples."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT ticket_id, assignee, locked_at FROM locks")
+            return cursor.fetchall()
+
+    def get_all_locks_with_age(self) -> list[tuple[str, str, float, float]]:
+        """Return all active locks as (ticket_id, assignee, locked_at, age_seconds) tuples."""
+        now = time.time()
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT ticket_id, assignee, locked_at FROM locks")
+            return [(tid, assignee, lat, now - lat) for tid, assignee, lat in cursor.fetchall()]
