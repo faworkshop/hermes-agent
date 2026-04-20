@@ -155,6 +155,31 @@ def github_get_pr(repo: str, pr_number: int, task_id: str = None) -> str:
     result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
     return json.dumps(result)
 
+def github_get_pr_checks(repo: str, pr_number: int, task_id: str = None) -> str:
+    """Get the status of all CI checks (GitHub Actions, status checks) for a PR.
+
+    This function first fetches the PR to get the head commit SHA, then retrieves
+    the check runs for that commit.
+
+    Returns a dict with a 'check_runs' list. Each check run has 'name', 'status',
+    'conclusion', and 'html_url'.
+    Status values: 'queued', 'in_progress', 'completed'.
+    Conclusion values: 'success', 'failure', 'cancelled', 'action_required', 'timed_out',
+                      'neutral', 'skipped', 'stale', or None (if status is not completed).
+    """
+    # First get the PR to find the head commit SHA
+    pr_data = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
+    if isinstance(pr_data, dict) and "head" in pr_data and pr_data["head"] and "sha" in pr_data["head"]:
+        head_sha = pr_data["head"]["sha"]
+    elif isinstance(pr_data, dict) and "head_sha" in pr_data:
+        head_sha = pr_data["head_sha"]
+    else:
+        return json.dumps({"error": "Could not determine PR head commit SHA", "pr_data": pr_data})
+
+    # Get check runs for the head commit
+    result = _execute_github_request("GET", f"repos/{repo}/commits/{head_sha}/check-runs")
+    return json.dumps(result)
+
 def github_add_label(repo: str, issue_number: int, labels: List[str], task_id: str = None) -> str:
     """Add labels to a PR or Issue. Used by Reviewer to trigger QA."""
     payload = {"labels": labels}
@@ -353,6 +378,26 @@ registry.register(
         }
     },
     handler=lambda args, **kw: github_get_pr(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
+registry.register(
+    name="github_get_pr_checks",
+    toolset="github",
+    schema={
+        "name": "github_get_pr_checks",
+        "description": "Get the status of all CI checks (GitHub Actions, status checks) for a Pull Request. Returns a list of checks with their name, status (queued/in_progress/completed), and conclusion (success/failure/cancelled/timed_out/etc.). This is the mandatory gate — Reviewer MUST verify that 'test-frontend' and 'test-backend' checks have passed before doing code review.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "pr_number": {"type": "integer", "description": "The PR number."}
+            },
+            "required": ["repo", "pr_number"]
+        }
+    },
+    handler=lambda args, **kw: github_get_pr_checks(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
 )

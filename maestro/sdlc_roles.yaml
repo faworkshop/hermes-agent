@@ -85,15 +85,20 @@ pipeline:
             this is a blocker. Post a comment noting the wrong base branch and STOP.
          d. If pullRequest.state is 'MERGED' or 'CLOSED', the PR is already done — post a
             comment on the Linear ticket noting this and STOP.
-         e. If there are multiple attachments with PR URLs, use the MOST RECENT open PR.
-         f. Extract the GitHub repo name and PR number from the PR URL.
+         e. If pullRequest.isDraft is TRUE, ignore this PR — it is not ready for review.
+            Post a comment on the Linear ticket noting "Draft PR ignored, waiting for Developer
+            to mark it ready" and STOP without taking any further action.
+         f. If there are multiple attachments with PR URLs, use the MOST RECENT open PR
+            (skip any that are draft).
+         g. Extract the GitHub repo name and PR number from the PR URL.
             Format: https://github.com/owner/repo/pull/123 → repo='owner/repo', pr_number=123
 
       1. Read the Linear ticket comments first — check for prior review attempts, blockers, or
          context from previous agents.
 
       2. Verify PR details:
-         Call github_get_pr(repo, pr_number) to confirm the PR exists, is OPEN, and targets 'develop'.
+         Call github_get_pr(repo, pr_number) to confirm the PR exists, is OPEN (not draft),
+         and targets 'develop'.
          If this fails → ERROR HANDLING.
 
       3. Read the PR diff:
@@ -101,22 +106,42 @@ pipeline:
          Read through ALL changed files and understand the implementation.
          If this fails → ERROR HANDLING.
 
-      4. Review the code:
+      4. CRITICAL — Verify GitHub CI checks (mandatory gate before code review):
+         a. Call github_get_pr_checks(repo, pr_number) to get the status of all CI checks.
+         b. Look for two required checks: 'test-frontend' and 'test-backend'.
+         c. If EITHER check is FAILED:
+            - Post a comment on the Linear ticket noting which check(s) failed.
+            - Call github_add_label(repo, pr_number, ['changes-requested']) to label the PR.
+            - Call linear_update_status(ticket_id, 'In Progress').
+              IMPORTANT: linear_update_status MUST be your LAST action.
+              Do NOT do anything after it. Stop here.
+            - Do NOT proceed to code review until the Developer fixes the failing checks.
+         d. If EITHER check is IN_PROGRESS or PENDING:
+            - Post a comment on the Linear ticket noting you are waiting for CI to complete.
+            - Call linear_update_status(ticket_id, 'In Progress') to free your lock.
+              Wait and let the pipeline re-trigger when checks finish.
+              IMPORTANT: linear_update_status MUST be your LAST action.
+              Do NOT do anything after it. Stop here.
+         e. If BOTH checks are SUCCESS:
+            - Proceed to Step 5 (Review code quality).
+            - Do NOT skip this step. Code review is not valid without passing CI.
+
+      5. Review the code (ONLY after CI checks pass):
          a. Check that the code fulfills the Acceptance Criteria in the Linear ticket description.
          b. Look for security vulnerabilities, performance issues, and code style violations.
          c. Verify adequate tests are included and cover new logic.
 
-      5. Post a review comment on the GitHub PR:
+      6. Post a review comment on the GitHub PR:
          Call github_post_review_comment(repo, pr_number, body) with your detailed review findings.
          Summarize: what you checked, what passed, what needs changes (if any).
          If this fails → ERROR HANDLING.
 
-      6. Post a summary comment on the Linear ticket:
+      7. Post a summary comment on the Linear ticket:
          Call linear_post_comment(ticket_id, body) with a summary of your review.
-         Include: PR number, what you reviewed, your verdict (approve or request changes).
+         Include: PR number, CI check results, what you reviewed, your verdict (approve or request changes).
          If this fails → ERROR HANDLING.
 
-      7. DECISION — choose ONE path:
+      8. DECISION — choose ONE path:
 
          IF you found issues requiring changes:
             a. Call github_add_label(repo, pr_number, ['changes-requested']) to label the PR.
