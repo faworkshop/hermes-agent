@@ -107,6 +107,52 @@ def linear_read_comments(ticket_id: str, task_id: str = None) -> str:
         return json.dumps({"success": True, "data": comments})
     return json.dumps(result)
 
+def linear_propose_handoff(ticket_id: str, current_role: str, next_role: str, task_id: str = None) -> str:
+    """Propose a handoff to the next agent role before transitioning the ticket state.
+
+    This must be called BEFORE linear_update_status when moving a ticket to a state
+    that belongs to a different agent role (e.g., Developer moving to 'In Review' for Reviewer,
+    or Reviewer moving to 'Ready For QA' for QA).
+
+    This records the pending handoff so the next agent can start immediately when
+    Linear fires the state-change webhook, without waiting for the current agent to finish.
+    The handoff expires after 60 seconds if the state transition is not confirmed.
+
+    Returns success=True if handoff was recorded, success=False if the lock
+    is not currently held by current_role (may indicate the agent lost its lock).
+    """
+    import sys
+    from pathlib import Path
+    # Import ConcurrencyManager — it lives in agent/concurrency.py
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from agent.concurrency import ConcurrencyManager
+    except ImportError:
+        return json.dumps({"success": False, "error": "ConcurrencyManager not available"})
+    cm = ConcurrencyManager()
+    ok = cm.propose_handoff(ticket_id, current_role, next_role)
+    if ok:
+        return json.dumps({"success": True, "message": f"Handoff proposed: {current_role} -> {next_role}"})
+    else:
+        return json.dumps({"success": False, "error": f"Lock not held by {current_role}, cannot propose handoff"})
+
+def linear_clear_handoff(ticket_id: str, current_role: str, task_id: str = None) -> str:
+    """Clear a pending handoff if the state transition was aborted.
+
+    Call this if you started a state transition but then decided not to complete it
+    (e.g., Linear API call failed and you did not retry).
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from agent.concurrency import ConcurrencyManager
+    except ImportError:
+        return json.dumps({"success": False, "error": "ConcurrencyManager not available"})
+    cm = ConcurrencyManager()
+    cm.clear_handoff(ticket_id, current_role)
+    return json.dumps({"success": True, "message": "Handoff cleared"})
+
 def linear_update_status(ticket_id: str, status: str, task_id: str = None) -> str:
     """Update the status of a Linear ticket by mapping name to stateId."""
     # 1. Fetch the issue to find its team and available states
@@ -479,6 +525,62 @@ registry.register(
         }
     },
     handler=lambda args, **kw: linear_post_comment(args.get("ticket_id", ""), args.get("body", ""), kw.get("task_id")),
+    check_fn=check_linear_requirements,
+    requires_env=["LINEAR_API_KEY"],
+)
+
+registry.register(
+    name="linear_propose_handoff",
+    toolset="linear",
+    schema={
+        "name": "linear_propose_handoff",
+        "description": "Propose a handoff to the next agent role BEFORE transitioning the ticket state. Call this before linear_update_status when moving to a state that belongs to a different role (e.g., Developer -> 'In Review' for Reviewer, Reviewer -> 'Ready For QA' for QA). The next agent can then start immediately when Linear fires the webhook, without waiting for the current agent to finish. The handoff expires after 60 seconds if not confirmed.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket_id": {
+                    "type": "string",
+                    "description": "The Linear ticket ID."
+                },
+                "current_role": {
+                    "type": "string",
+                    "description": "The current agent role performing the transition (e.g., 'Developer', 'Reviewer', 'QA')."
+                },
+                "next_role": {
+                    "type": "string",
+                    "description": "The next agent role that should take over (e.g., 'Reviewer', 'QA')."
+                }
+            },
+            "required": ["ticket_id", "current_role", "next_role"]
+        }
+    },
+    handler=lambda args, **kw: linear_propose_handoff(args.get("ticket_id", ""), args.get("current_role", ""), args.get("next_role", ""), kw.get("task_id")),
+    check_fn=check_linear_requirements,
+    requires_env=["LINEAR_API_KEY"],
+)
+
+registry.register(
+    name="linear_clear_handoff",
+    toolset="linear",
+    schema={
+        "name": "linear_clear_handoff",
+        "description": "Clear a pending handoff if a state transition was aborted. Call this if linear_update_status failed and you did not complete the transition.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket_id": {
+                    "type": "string",
+                    "description": "The Linear ticket ID."
+                },
+                "current_role": {
+                    "type": "string",
+                    "description": "The current agent role that proposed the handoff."
+                }
+            },
+            "required": ["ticket_id", "current_role"]
+        }
+    },
+    handler=lambda args, **kw: linear_clear_handoff(args.get("ticket_id", ""), args.get("current_role", ""), kw.get("task_id")),
     check_fn=check_linear_requirements,
     requires_env=["LINEAR_API_KEY"],
 )

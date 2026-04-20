@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Local Pipeline Orchestrator for Multi-Agent SDLC
+Local Pipeline Orchestrator for Multi-Agent SDLC.
 
-Simulates the event-driven Linear -> GitHub workflow locally without needing webhooks.
+Simulates the event-driven Linear -> GitHub workflow locally without webhooks.
 Runs the Product Manager, Developer, Reviewer, and QA agents sequentially.
 
-Role definitions (prompts, toolsets, shared rules): ``conductor/sdlc_roles.yaml``.
+Role definitions (prompts, toolsets, shared rules): ``maestro/sdlc_roles.yaml``.
 Override path with env ``SDLC_ROLES_PATH``.
 """
 
@@ -24,16 +24,14 @@ logger = logging.getLogger(__name__)
 # Mock Database for locks and retry counters
 DB = {
     "locks": {},  # ticket_id -> assignee
-    "retries": {} # ticket_id -> count
+    "retries": {},  # ticket_id -> count
 }
 
 _logged_minimax_openai_fallback = False
 
 
 def _normalize_minimax_runtime_if_no_anthropic_sdk(rt: Dict[str, Any]) -> Dict[str, Any]:
-    """Hermes defaults MiniMax to …/anthropic (Anthropic Messages SDK). If ``anthropic``
-    is not installed, use MiniMax's OpenAI-compatible ``/v1`` endpoint instead.
-    """
+    """If Anthropic SDK is missing, fall back MiniMax to OpenAI-compatible /v1."""
     global _logged_minimax_openai_fallback
     out = dict(rt)
     prov = (out.get("provider") or "").strip().lower()
@@ -66,7 +64,7 @@ def _normalize_minimax_runtime_if_no_anthropic_sdk(rt: Dict[str, Any]) -> Dict[s
 
 
 def _hermes_model_and_runtime() -> Tuple[str, Dict[str, Any]]:
-    """Resolve model + provider runtime from ~/.hermes/config.yaml (same as `hermes chat`)."""
+    """Resolve model + provider runtime from ~/.hermes/config.yaml."""
     from hermes_cli.config import load_config
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -80,7 +78,6 @@ def _hermes_model_and_runtime() -> Tuple[str, Dict[str, Any]]:
     rt = resolve_runtime_provider()
     provider = (rt.get("provider") or "").strip().lower()
     if not model and provider in ("minimax", "minimax-cn"):
-        # Matches auxiliary_client default when no slug is configured.
         model = "MiniMax-M2.7"
     if not model:
         raise RuntimeError(
@@ -95,7 +92,7 @@ def _render_template(text: str, ticket_id: str) -> str:
 
 
 def _default_sdlc_config() -> Dict[str, Any]:
-    """Fallback if conductor/sdlc_roles.yaml is missing or invalid."""
+    """Fallback if roles yaml is missing or invalid."""
     return {
         "common_system": (
             "You are part of an automated SDLC pipeline. Read tickets and comments first; "
@@ -132,12 +129,12 @@ def _default_sdlc_config() -> Dict[str, Any]:
 
 
 def load_sdlc_config() -> Dict[str, Any]:
-    """Load ``conductor/sdlc_roles.yaml`` (or ``SDLC_ROLES_PATH``)."""
+    """Load ``maestro/sdlc_roles.yaml`` (or ``SDLC_ROLES_PATH``)."""
     override = (os.environ.get("SDLC_ROLES_PATH") or "").strip()
     if override:
         path = Path(override).expanduser()
     else:
-        path = Path(__file__).resolve().parent / "conductor" / "sdlc_roles.yaml"
+        path = Path(__file__).resolve().parent / "sdlc_roles.yaml"
     if not path.is_file():
         logger.warning("SDLC roles file not found at %s — using built-in defaults", path)
         return _default_sdlc_config()
@@ -165,16 +162,18 @@ def check_lock(ticket_id: str, agent_name: str) -> bool:
     if current and current != agent_name:
         logger.warning(f"Ticket {ticket_id} is locked by {current}. {agent_name} cannot proceed.")
         return False
-    
+
     DB["locks"][ticket_id] = agent_name
     logger.info(f"Lock acquired on {ticket_id} by {agent_name}.")
     return True
+
 
 def release_lock(ticket_id: str, agent_name: str):
     """Release the lock."""
     if DB["locks"].get(ticket_id) == agent_name:
         del DB["locks"][ticket_id]
         logger.info(f"Lock released on {ticket_id} by {agent_name}.")
+
 
 def run_agent(
     role: str,
@@ -193,7 +192,9 @@ def run_agent(
     if role in cb_agents:
         retries = DB["retries"].get(ticket_id, 0)
         if retries >= 3:
-            logger.error(f"🚨 Circuit Breaker Tripped! Max retries (3) reached for {ticket_id}. Halting automation.")
+            logger.error(
+                f"🚨 Circuit Breaker Tripped! Max retries (3) reached for {ticket_id}. Halting automation."
+            )
             return False
 
     if not check_lock(ticket_id, role):
@@ -224,15 +225,16 @@ def run_agent(
     try:
         response = agent.run_conversation(
             user_message=prompt,
-            system_message=system_message
+            system_message=system_message,
         )
         logger.info(f"{role} Agent finished. Final response:\n{response}")
     except Exception as e:
         logger.error(f"{role} Agent encountered an error: {e}")
     finally:
         release_lock(ticket_id, role)
-        
+
     return True
+
 
 def simulate_pipeline():
     """Simulate the full lifecycle of a dummy ticket."""
@@ -270,7 +272,6 @@ def simulate_pipeline():
             max_iterations=max_iterations,
         )
 
-    # Simulate a loop rejection (Circuit Breaker Test)
     logger.info("\n--- Simulating a Circuit Breaker (Retry Loop) ---")
     DB["retries"][ticket_id] = 3
     dev_step = next((s for s in cfg["pipeline"] if s.get("agent_key") == "Developer"), None)
@@ -287,6 +288,7 @@ def simulate_pipeline():
         system_message=system_message,
         circuit_breaker_agents=cb,
     )
+
 
 if __name__ == "__main__":
     logger.info("Initializing multi-agent CI/CD pipeline simulation...")

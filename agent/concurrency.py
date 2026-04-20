@@ -17,7 +17,9 @@ class ConcurrencyManager:
                 CREATE TABLE IF NOT EXISTS locks (
                     ticket_id TEXT PRIMARY KEY,
                     assignee TEXT,
-                    locked_at REAL
+                    locked_at REAL,
+                    pending_assignee TEXT,
+                    pending_at REAL
                 )
             """)
             conn.execute("""
@@ -29,29 +31,69 @@ class ConcurrencyManager:
             conn.commit()
 
     def acquire_lock(self, ticket_id: str, agent_name: str, timeout: float = 1800.0) -> bool:
-        """Try to acquire a lock for a ticket. Stale locks (older than `timeout` seconds) are auto-expired."""
+        """Try to acquire a lock for a ticket.
+        
+        Allows immediate acquisition if:
+        - No lock exists (fresh ticket)
+        - Lock is stale (> timeout seconds)
+        - Current assignee is the same agent (re-entrancy)
+        - A pending_handoff exists and the requesting agent IS the pending assignee
+          (previous agent started a state transition to this agent's role)
+        """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT assignee, locked_at FROM locks WHERE ticket_id = ?", (ticket_id,))
+            cursor.execute(
+                "SELECT assignee, locked_at, pending_assignee, pending_at FROM locks WHERE ticket_id = ?",
+                (ticket_id,)
+            )
             row = cursor.fetchone()
 
             if row:
-                current_assignee, locked_at = row[0], row[1]
+                current_assignee, locked_at, pending_assignee, pending_at = row[0], row[1], row[2], row[3]
                 age = time.time() - locked_at
+
+                # Expire stale locks
                 if age > timeout:
-                    # Stale lock — expire it and proceed to acquire
                     logger.info(
                         f"Ticket {ticket_id} lock by {current_assignee} is stale "
                         f"({age:.0f}s old, max {timeout}s). Expiring and re-acquiring."
                     )
                     conn.execute("DELETE FROM locks WHERE ticket_id = ?", (ticket_id,))
                     conn.commit()
-                else:
-                    if current_assignee == agent_name:
-                        return True
-                    logger.warning(f"Ticket {ticket_id} is already locked by {current_assignee} ({age:.0f}s old)")
-                    return False
+                    cursor.execute(
+                        "INSERT INTO locks (ticket_id, assignee, locked_at) VALUES (?, ?, ?)",
+                        (ticket_id, agent_name, time.time())
+                    )
+                    conn.commit()
+                    return True
 
+                # Same agent re-entrancy — always allowed
+                if current_assignee == agent_name:
+                    return True
+
+                # Pending handoff — previous agent transitioned this ticket to us.
+                # Allow acquisition while the previous agent finishes.
+                if pending_assignee == agent_name and pending_at and (time.time() - pending_at) < 60:
+                    logger.info(
+                        f"Ticket {ticket_id}: pending handoff from {current_assignee} to {agent_name} "
+                        f"(initiated {time.time() - pending_at:.0f}s ago). Allowing."
+                    )
+                    # Upgrade: update assignee to us, clear pending
+                    conn.execute(
+                        "UPDATE locks SET assignee=?, pending_assignee=NULL, pending_at=NULL, locked_at=? "
+                        "WHERE ticket_id=?",
+                        (agent_name, time.time(), ticket_id)
+                    )
+                    conn.commit()
+                    return True
+
+                logger.warning(
+                    f"Ticket {ticket_id} is already locked by {current_assignee} ({age:.0f}s old), "
+                    f"pending={pending_assignee}"
+                )
+                return False
+
+            # No lock — fresh acquire
             cursor.execute(
                 "INSERT INTO locks (ticket_id, assignee, locked_at) VALUES (?, ?, ?)",
                 (ticket_id, agent_name, time.time())
@@ -60,10 +102,44 @@ class ConcurrencyManager:
             return True
 
     def release_lock(self, ticket_id: str, agent_name: str):
-        """Release a lock if held by the agent."""
+        """Release a lock if held by the agent. Clears any pending handoff too."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "DELETE FROM locks WHERE ticket_id = ? AND assignee = ?",
+                (ticket_id, agent_name)
+            )
+            conn.commit()
+
+    def propose_handoff(self, ticket_id: str, current_assignee: str, next_assignee: str) -> bool:
+        """Record a pending handoff from current_assignee to next_assignee.
+        
+        Called by an agent BEFORE it updates Linear's state to the next role's state.
+        This allows the next agent to acquire the lock immediately without waiting
+        for the current agent to finish.
+        
+        Returns True if handoff was recorded, False if lock not held by current_assignee.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT assignee FROM locks WHERE ticket_id = ? AND assignee = ?",
+                (ticket_id, current_assignee)
+            )
+            if not cursor.fetchone():
+                return False
+            conn.execute(
+                "UPDATE locks SET pending_assignee=?, pending_at=? WHERE ticket_id=?",
+                (next_assignee, time.time(), ticket_id)
+            )
+            conn.commit()
+            return True
+
+    def clear_handoff(self, ticket_id: str, agent_name: str):
+        """Clear any pending handoff. Call if the state transition was aborted."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE locks SET pending_assignee=NULL, pending_at=NULL "
+                "WHERE ticket_id=? AND assignee=?",
                 (ticket_id, agent_name)
             )
             conn.commit()
