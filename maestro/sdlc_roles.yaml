@@ -77,8 +77,17 @@ pipeline:
       4. Read the PR diff and ensure the code fulfills the Acceptance Criteria of the ticket.
       5. Check for security vulnerabilities, performance bottlenecks, and code style violations.
       6. Verify that adequate tests are included and that they cover the new logic.
-      7. If changes are needed, post inline comments or a general review requesting changes, and move the Linear ticket back to 'In Progress'.
-      8. If the code is high quality, approve the PR, use the github tool to add the 'ready-for-qa' label to the PR, and move the Linear ticket to 'Ready For QA'. NEVER mark a ticket as 'Done' after review approval — QA must verify first.
+      7. **IF CHANGES ARE NEEDED** (rejection):
+         a. Post inline comments or a general review requesting changes on the PR.
+         b. Use `linear_update_ticket` to move the ticket to 'In Progress' immediately. This is REQUIRED — not optional. The ticket MUST leave 'In Review'.
+         c. After moving, verify by re-fetching the ticket. If status did not change, retry up to 2 times.
+         d. Stop here. Do not add labels, do not pass to QA.
+      8. **IF CODE IS HIGH QUALITY** (approval):
+         a. Approve the PR via the github tool.
+         b. Add the 'ready-for-qa' label to the PR.
+         c. Use `linear_update_ticket` to move the Linear ticket to 'Ready For QA'. This is REQUIRED — not optional.
+         d. Verify the status update succeeded. If it failed, retry up to 2 times.
+         e. NEVER mark a ticket as 'Done' after approval — QA must verify first. Stop here.
     prompt: |
       Ticket {{ticket_id}} is 'In Review'. First read the Linear ticket to find the linked PR number. Then fetch the PR diff, review the code for quality and tests. If approved, add the 'ready-for-qa' label to the PR and move the ticket to 'Ready For QA'. Post a summary.
 
@@ -95,7 +104,15 @@ pipeline:
       2. Spin up the application stack (e.g., using Docker Compose).
       3. Run integration and End-to-End (E2E) tests.
       4. Post the raw test results as a comment on the PR.
-      5. If tests pass, merge the PR into `develop`, and move the Linear ticket to 'Ready For Delivery'.
-      6. If tests fail, request changes on the PR, detailing the failure, and move the Linear ticket back to 'In Progress'.
+      5. **IF TESTS PASS**:
+         a. Merge the PR into `develop`.
+         b. Use `linear_update_ticket` to move the Linear ticket to 'Ready For Delivery'. REQUIRED — not optional.
+         c. Verify the status update. Retry up to 2 times if it fails.
+         d. Stop here.
+      6. **IF TESTS FAIL**:
+         a. Post a comment on the PR detailing the failure.
+         b. Use `linear_update_ticket` to move the Linear ticket back to 'In Progress'. REQUIRED — not optional.
+         c. Verify the status update. Retry up to 2 times if it fails.
+         d. Stop here. Do NOT leave the ticket in 'In Review'.
     prompt: |
       Ticket {{ticket_id}} is 'Ready For QA'. Pull the branch, run integration/E2E tests in the terminal. If tests pass, merge the PR into `develop` and move it to 'Ready For Delivery'. If they fail, report the errors and move it back to 'In Progress'.
