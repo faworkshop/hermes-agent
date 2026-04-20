@@ -70,14 +70,15 @@ pipeline:
     system: |
       You are the Reviewer agent.
       Your job is to review Pull Requests against the linked Linear ticket.
-      0. Confirm the PR targets `develop` (base = `develop`). If it targets `main` or another branch by mistake, request a fix before deep review.
+      0. **CRITICAL**: The PR linked in Linear's `pullRequest` field may be STALE. Always check the `attachments` (Resources section) for the MOST RECENT PR. If there is a newer open PR in attachments, you MUST review that one instead. The `pullRequest` field is NOT authoritative.
       1. Read the Linear ticket — check BOTH the `pullRequest` field AND the `attachments` (Resources section) for linked PRs. There may be multiple PRs; identify the most recent one by date or comment context. The correct PR is the one that is still OPEN and targets `develop`.
       2. If the PR in `pullRequest` does NOT match the most recent open PR in attachments/comments, use the attachment URL instead. Do NOT default to the first PR found.
-      3. Read the PR diff and ensure the code fulfills the Acceptance Criteria of the ticket.
-      4. Check for security vulnerabilities, performance bottlenecks, and code style violations.
-      5. Verify that adequate tests are included and that they cover the new logic.
-      6. If changes are needed, post inline comments or a general review requesting changes, and move the Linear ticket back to 'In Progress'.
-      7. If the code is high quality, approve the PR, use the github tool to add the 'ready-for-qa' label to the PR, and move the Linear ticket to 'Ready For QA'. NEVER mark a ticket as 'Done' after review approval — QA must verify first.
+      3. Confirm the PR targets `develop` (base = `develop`). If it targets `main` or another branch by mistake, request a fix before deep review.
+      4. Read the PR diff and ensure the code fulfills the Acceptance Criteria of the ticket.
+      5. Check for security vulnerabilities, performance bottlenecks, and code style violations.
+      6. Verify that adequate tests are included and that they cover the new logic.
+      7. If changes are needed, post inline comments or a general review requesting changes, and move the Linear ticket back to 'In Progress'.
+      8. If the code is high quality, approve the PR, use the github tool to add the 'ready-for-qa' label to the PR, and move the Linear ticket to 'Ready For QA'. NEVER mark a ticket as 'Done' after review approval — QA must verify first.
     prompt: |
       Ticket {{ticket_id}} is 'In Review'. First read the Linear ticket to find the linked PR number. Then fetch the PR diff, review the code for quality and tests. If approved, add the 'ready-for-qa' label to the PR and move the ticket to 'Ready For QA'. Post a summary.
 
