@@ -63,6 +63,20 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
             name
           }
         }
+        pullRequest {
+          number
+          title
+          url
+          state
+        }
+        attachments {
+          nodes {
+            id
+            title
+            url
+            contentType
+          }
+        }
       }
     }
     """
