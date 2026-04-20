@@ -1,0 +1,334 @@
+import os
+import hmac
+import hashlib
+import json
+import logging
+import asyncio
+import requests
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+from typing import Dict, Any
+
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+
+from agent.concurrency import ConcurrencyManager
+from run_agent import AIAgent
+
+try:
+    from .pipeline_orchestrator import (
+        _hermes_model_and_runtime,
+        _normalize_minimax_runtime_if_no_anthropic_sdk,
+        load_sdlc_config,
+    )
+except ImportError:
+    from pipeline_orchestrator import (  # type: ignore
+        _hermes_model_and_runtime,
+        _normalize_minimax_runtime_if_no_anthropic_sdk,
+        load_sdlc_config,
+    )
+
+logger = logging.getLogger("webhook_server")
+logger.setLevel(logging.INFO)
+
+_log_dir = Path(__file__).resolve().parent / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+WEBHOOK_LOG_PATH = _log_dir / "webhook_server.log"
+_log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+if not logger.handlers:
+    _stream = logging.StreamHandler()
+    _stream.setFormatter(_log_fmt)
+    logger.addHandler(_stream)
+    _file = RotatingFileHandler(
+        WEBHOOK_LOG_PATH,
+        maxBytes=5_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    _file.setFormatter(_log_fmt)
+    logger.addHandler(_file)
+
+app = FastAPI(title="Hermes Webhook Server")
+cm = ConcurrencyManager()
+
+LINEAR_WEBHOOK_SECRET=os.getenv("LINEAR_WEBHOOK_SECRET") or os.getenv("LINEAR_HMAC_SECRET")
+LINEAR_BOT_USER_ID = os.getenv("LINEAR_BOT_USER_ID")
+LINEAR_API_KEY = os.getenv("LINEAR_API_KEY", "")
+LINEAR_API_URL = "https://api.linear.app/graphql"
+NEEDS_HUMAN_LABEL_ID = "331b7988-b4b2-4116-853a-ced489f5eb5f"
+
+
+def _linear_gql(query: str, variables: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Execute a GraphQL mutation/query against the Linear API. Returns the data or {} on error."""
+    if not LINEAR_API_KEY:
+        return {}
+    try:
+        resp = requests.post(
+            LINEAR_API_URL,
+            headers={"Content-Type": "application/json", "Authorization": LINEAR_API_KEY},
+            json={"query": query, "variables": variables or {}},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if "errors" in result:
+            logger.error("Linear API errors: %s", result["errors"])
+            return {}
+        return result.get("data", {})
+    except Exception as e:
+        logger.error("Linear API request failed: %s", e)
+        return {}
+
+# Linear state titles are user-defined; casing/spacing can differ from our canonical labels
+# (e.g. "Ready for QA" vs "Ready For QA"). Lookups use a normalized key.
+_STATE_AGENT_MAPPING_RAW: Dict[str, str] = {
+    "Backlog": "Product Manager",
+    "New": "Product Manager",
+    "Todo": "Product Manager",
+    "Unstarted": "Product Manager",
+    "Triage": "Product Manager",
+    "In Progress": "Developer",
+    "In Review": "Reviewer",
+    "Ready For QA": "QA",
+}
+
+
+def _normalize_linear_state_name(name: str) -> str:
+    """Collapse whitespace and compare case-insensitively (Linear UI casing varies)."""
+    return " ".join((name or "").split()).casefold()
+
+
+_STATE_AGENT_BY_NORMALIZED = {
+    _normalize_linear_state_name(k): v for k, v in _STATE_AGENT_MAPPING_RAW.items()
+}
+
+# Public alias (canonical labels) for operators extending the map.
+STATE_AGENT_MAPPING = dict(_STATE_AGENT_MAPPING_RAW)
+
+ROLE_TOOLSETS = {
+    "Product Manager": ["linear"],
+    "Developer": ["linear", "github", "terminal", "file"],
+    "Reviewer": ["linear", "github"],
+    "QA": ["linear", "github", "terminal"],
+}
+
+def _add_needs_human_label(ticket_id: str, blocked_role: str) -> None:
+    """Add the needs-human label to a ticket. Idempotent — no error if already present."""
+    # Fetch current labels and add needs-human if not already there
+    query = """
+    query IssueLabels($id: String!) {
+      issue(id: $id) {
+        labels { nodes { id } }
+        team { labels { nodes { id name } } }
+      }
+    }
+    """
+    data = _linear_gql(query, {"id": ticket_id})
+    if not data:
+        return
+
+    issue_labels = data.get("issue", {})
+    current_ids = [l["id"] for l in issue_labels.get("labels", {}).get("nodes", [])]
+    if NEEDS_HUMAN_LABEL_ID in current_ids:
+        logger.info("Ticket %s already has needs-human label", ticket_id)
+        return
+
+    # Resolve label by name if needed (use hardcoded ID since we know it)
+    team_labels = issue_labels.get("team", {}).get("labels", {}).get("nodes", [])
+    label_id = NEEDS_HUMAN_LABEL_ID
+    for lbl in team_labels:
+        if lbl["name"].lower() == "needs-human":
+            label_id = lbl["id"]
+            break
+
+    new_ids = current_ids + [label_id]
+    mutation = """
+    mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }
+    """
+    result = _linear_gql(mutation, {"id": ticket_id, "input": {"labelIds": new_ids}})
+    if result:
+        logger.info("Added needs-human label to ticket %s", ticket_id)
+
+
+def _post_locked_comment(ticket_id: str, blocked_role: str, attempted_state: str) -> None:
+    """Post a comment explaining why the transition was blocked."""
+    body = (
+        f"⚠️ **Transition Blocked — Agent Conflict**\n\n"
+        f"A `{attempted_state}` transition was attempted for this ticket, but a "
+        f"`{blocked_role}` agent is currently in progress and holds the lock.\n\n"
+        f"The development operation has been aborted and `needs-human` label applied. "
+        f"Please resolve the conflict manually:\n\n"
+        f"- If the in-progress agent is still working, wait for it to finish.\n"
+        f"- If the agent is stuck, manually release the lock or move the ticket as appropriate."
+    )
+    mutation = """
+    mutation CommentCreate($input: CommentCreateInput!) {
+      commentCreate(input: $input) { success comment { id } }
+    }
+    """
+    _linear_gql(mutation, {"input": {"issueId": ticket_id, "body": body}})
+    logger.info("Posted lock-conflict comment on ticket %s", ticket_id)
+
+
+def verify_linear_signature(body: bytes, signature: str) -> bool:
+    if not LINEAR_WEBHOOK_SECRET:
+        return True
+    computed_signature = hmac.new(
+        LINEAR_WEBHOOK_SECRET.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(computed_signature, signature)
+
+
+async def run_agent_task(role: str, ticket_id: str, prompt: str):
+    if role in ["Developer", "Reviewer", "QA"]:
+        retries = cm.get_retry_count(ticket_id)
+        if retries >= 3:
+            logger.error(f"🚨 Circuit Breaker Tripped for {ticket_id}. Max retries reached.")
+            return
+
+    # Lock already acquired in the foreground before this background task was queued.
+    # Skip the duplicate acquire here — just release it when done.
+    # (We still record the role so release_lock knows who to release.)
+
+    logger.info(f"Starting {role} Agent for {ticket_id}")
+
+    # Load system message and toolsets from sdlc_roles.yaml
+    cfg = load_sdlc_config()
+    common = (cfg.get("common_system") or "").strip()
+    role_step = next((s for s in cfg.get("pipeline", []) if s.get("agent_key") == role), None)
+    role_system = ((role_step or {}).get("system") or "").strip() if role_step else ""
+    system_message = f"{common}\n\n{role_system}".strip() if common else role_system
+
+    # Fallback toolsets from hardcoded map if not in YAML
+    if role_step and role_step.get("toolsets"):
+        enabled_toolsets = role_step["toolsets"]
+    else:
+        enabled_toolsets = ROLE_TOOLSETS.get(role, ["linear"])
+
+    try:
+        model, rt = _hermes_model_and_runtime()
+        rt = _normalize_minimax_runtime_if_no_anthropic_sdk(rt)
+        agent = AIAgent(
+            model=model,
+            api_key=rt.get("api_key"),
+            base_url=rt.get("base_url"),
+            provider=rt.get("provider"),
+            api_mode=rt.get("api_mode"),
+            acp_command=rt.get("command"),
+            acp_args=list(rt.get("args") or []),
+            credential_pool=rt.get("credential_pool"),
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=False,
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: agent.run_conversation(user_message=prompt, system_message=system_message),
+        )
+    except Exception as e:
+        logger.error(f"Error running {role} Agent for {ticket_id}: {e}")
+    finally:
+        cm.release_lock(ticket_id, role)
+
+
+def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
+    logger.info("Linear webhook ignored: %s (%s)", reason, ctx)
+    return {"status": "ignored", "reason": reason}
+
+
+@app.post("/linear-webhook")
+async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
+    body = await request.body()
+    signature = request.headers.get("linear-signature")
+
+    if signature and not verify_linear_signature(body, signature):
+        logger.warning("Linear webhook rejected: invalid linear-signature")
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        logger.warning("Linear webhook rejected: body is not valid JSON")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    action = payload.get("action")
+    data = payload.get("data", {}) or {}
+    type_ = payload.get("type")
+    ticket_id = data.get("identifier") if isinstance(data, dict) else None
+    state_name = (data.get("state") or {}).get("name") if isinstance(data.get("state"), dict) else None
+
+    logger.info(
+        "Linear webhook received: type=%r action=%r identifier=%r state=%r",
+        type_,
+        action,
+        ticket_id,
+        state_name,
+    )
+
+    if type_ != "Issue":
+        return _log_ignored("Not an Issue event", type=type_)
+    if not ticket_id:
+        return _log_ignored("No ticket identifier")
+
+    actor_id = payload.get("actor", {}).get("id")
+    if LINEAR_BOT_USER_ID and actor_id == LINEAR_BOT_USER_ID and action != "update":
+        return _log_ignored("Action performed by bot", actor_id=actor_id, action=action)
+
+    new_state = state_name
+    if not new_state:
+        updated_from = payload.get("updatedFrom") or {}
+        if isinstance(updated_from, dict) and "stateId" in updated_from:
+            return _log_ignored(
+                "State id changed but state name missing in payload",
+                updated_from=updated_from,
+            )
+        return _log_ignored("No state on payload and no state change", action=action)
+
+    state_key = _normalize_linear_state_name(new_state)
+    role = _STATE_AGENT_BY_NORMALIZED.get(state_key)
+    if not role:
+        return _log_ignored(
+            f"No agent mapped to state: {new_state}",
+            state=new_state,
+            normalized=state_key,
+        )
+
+    # Check lock in the foreground BEFORE accepting the state change.
+    # If the ticket is already locked by a different role's in-progress agent,
+    # abort the dev operation: add needs-human label and post a comment.
+    if not cm.acquire_lock(ticket_id, role):
+        logger.warning(
+            "Agent %s for %s blocked: ticket is already locked by another agent. "
+            "Adding needs-human label and posting comment.",
+            role, ticket_id,
+        )
+        _add_needs_human_label(ticket_id, role)
+        _post_locked_comment(ticket_id, role, new_state)
+        return {
+            "status": "locked",
+            "detail": (
+                f"Cannot start {role} agent for {ticket_id}: "
+                f"ticket is currently locked by an in-progress agent. "
+                f"A 'needs-human' label has been added and a comment posted."
+            ),
+        }
+
+    prompt = f"Ticket {ticket_id} has moved to '{new_state}'. Please perform your duties as {role}."
+    logger.info("Linear webhook accepted: ticket=%s state=%r -> agent=%s", ticket_id, new_state, role)
+    background_tasks.add_task(run_agent_task, role, ticket_id, prompt)
+    return {"status": "accepted", "agent": role, "ticket": ticket_id}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
