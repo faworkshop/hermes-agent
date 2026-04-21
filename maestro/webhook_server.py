@@ -329,8 +329,90 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
 
 
 @app.get("/health")
-async def health():
+async def Health():
     return {"status": "ok"}
+
+
+@app.post("/trigger-agent")
+async def trigger_agent(
+    role: str,
+    ticket_id: str,
+    prompt: str = None,
+    background_tasks: BackgroundTasks = None,
+):
+    """Manually trigger an SDLC agent without requiring a Linear status change.
+
+    This endpoint bypasses the Linear webhook entirely — no status change needed,
+    no signature verification, no label updates.
+
+    Args:
+        role: Which agent to run — "Developer", "Reviewer", or "QA"
+        ticket_id: Linear ticket identifier, e.g. "FAW-26"
+        prompt: Optional custom prompt. If omitted, a default is constructed from
+                the ticket_id and role.
+
+    Returns:
+        {"status": "accepted", "agent": role, "ticket": ticket_id}
+        or {"status": "locked", "detail": "..."} if another agent holds the lock.
+    """
+    valid_roles = {"Developer", "Reviewer", "QA"}
+    if role not in valid_roles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}",
+        )
+
+    if not ticket_id or not ticket_id.strip():
+        raise HTTPException(status_code=400, detail="ticket_id is required")
+
+    ticket_id = ticket_id.strip()
+
+    # Same lock-acquire pattern as the Linear webhook
+    if not cm.acquire_lock(ticket_id, role):
+        return {
+            "status": "locked",
+            "detail": (
+                f"Cannot start {role} agent for {ticket_id}: "
+                f"ticket is currently locked by an in-progress agent. "
+                f"Use DELETE /agent-lock/{ticket_id} to clear the lock first."
+            ),
+        }
+
+    if not prompt or not prompt.strip():
+        prompt = f"Ticket {ticket_id} — please perform your {role} duties."
+
+    logger.info("Manual trigger: role=%r ticket=%r", role, ticket_id)
+
+    # Background task so this endpoint returns immediately
+    if background_tasks is None:
+        raise HTTPException(status_code=500, detail="BackgroundTasks not available")
+    background_tasks.add_task(run_agent_task, role, ticket_id, prompt)
+
+    return {"status": "accepted", "agent": role, "ticket": ticket_id}
+
+
+@app.delete("/agent-lock/{ticket_id}")
+async def clear_agent_lock(ticket_id: str):
+    """Force-clear the lock for a ticket. Use this when an agent crashed
+    or is stuck and you need to manually restart the pipeline.
+
+    Returns {"status": "cleared", "ticket": ticket_id} or
+            {"status": "not_found"} if there was no lock.
+    """
+    cleared = cm.force_clear(ticket_id)
+    if cleared:
+        logger.info("Lock force-cleared for %s", ticket_id)
+        return {"status": "cleared", "ticket": ticket_id, "role": cleared}
+    return {"status": "not_found", "ticket": ticket_id}
+
+
+@app.get("/agent-lock/{ticket_id}")
+async def get_agent_lock(ticket_id: str):
+    """Check whether a ticket is currently locked, and if so by which role."""
+    lock = cm.get_lock(ticket_id)
+    if lock:
+        return {"status": "locked", "ticket": ticket_id, "role": lock.get("role"), "acquired_at": lock.get("acquired_at")}
+    return {"status": "unlocked", "ticket": ticket_id}
 
 
 if __name__ == "__main__":

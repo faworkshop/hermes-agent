@@ -68,6 +68,31 @@ class ConcurrencyManager:
             )
             conn.commit()
 
+    def force_clear(self, ticket_id: str) -> Optional[str]:
+        """Force-clear any lock on a ticket regardless of who holds it.
+        Returns the role that was cleared, or None if there was no lock.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT assignee FROM locks WHERE ticket_id = ?", (ticket_id,))
+            row = cursor.fetchone()
+            if row:
+                assignee = row[0]
+                conn.execute("DELETE FROM locks WHERE ticket_id = ?", (ticket_id,))
+                conn.commit()
+                return assignee
+            return None
+
+    def get_lock(self, ticket_id: str) -> Optional[dict]:
+        """Return lock info for a ticket, or None if unlocked."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT assignee, locked_at FROM locks WHERE ticket_id = ?", (ticket_id,))
+            row = cursor.fetchone()
+            if row:
+                return {"role": row[0], "acquired_at": row[1]}
+            return None
+
     def get_retry_count(self, ticket_id: str) -> int:
         """Get the current retry count for a ticket."""
         with sqlite3.connect(self.db_path) as conn:
