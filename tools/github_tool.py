@@ -150,6 +150,16 @@ def github_merge_pr(repo: str, pr_number: int, task_id: str = None) -> str:
     return json.dumps(result)
 
 
+def github_update_pr(repo: str, pr_number: int, ready_for_review: bool = True, task_id: str = None) -> str:
+    """Update a Pull Request — commonly used to convert a draft PR to ready for review.
+
+    Set ready_for_review=True to mark the PR as OPEN (ready for review).
+    Set ready_for_review=False to convert back to draft.
+    """
+    payload = {"draft": not ready_for_review}
+    result = _execute_github_request("PATCH", f"repos/{repo}/pulls/{pr_number}", data=payload)
+    return json.dumps(result)
+
 def github_get_pr(repo: str, pr_number: int, task_id: str = None) -> str:
     """Get full details of a Pull Request including head/base branch info."""
     result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
@@ -378,6 +388,27 @@ registry.register(
         }
     },
     handler=lambda args, **kw: github_get_pr(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
+registry.register(
+    name="github_update_pr",
+    toolset="github",
+    schema={
+        "name": "github_update_pr",
+        "description": "Update a Pull Request. Most commonly used to convert a draft PR to OPEN (ready for review) by setting ready_for_review=True. Can also convert an open PR back to draft by setting ready_for_review=False.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "pr_number": {"type": "integer", "description": "The PR number to update."},
+                "ready_for_review": {"type": "boolean", "description": "Set True to convert draft PR to open (ready for review). Set False to convert back to draft. Default is True."}
+            },
+            "required": ["repo", "pr_number"]
+        }
+    },
+    handler=lambda args, **kw: github_update_pr(args.get("repo", ""), args.get("pr_number", 0), args.get("ready_for_review", True), kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
 )

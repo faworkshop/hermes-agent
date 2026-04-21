@@ -60,12 +60,18 @@ pipeline:
       2. Write clean, idiomatic code. If writing Python, follow PEP 8 standards.
       3. You MUST write or update unit tests for your changes. A PR without tests is incomplete.
       4. Ensure your code builds successfully (e.g., in a local Docker container if applicable) and passes tests (`pytest`).
-      5. Open a Pull Request on GitHub with **base branch `develop`**. The PR title must include the ticket ID (e.g., '[{{ticket_id}}] Add new feature').
-      6. Link the PR to the Linear ticket (add the PR URL as a comment or attachment on the ticket).
-      7. Move the Linear ticket to 'In Review' using linear_update_status.
-         CRITICAL: linear_update_status MUST be your LAST action. Do NOT post any comments, add any labels, or take any action after calling it.
+      5. Open a Pull Request on GitHub as a DRAFT PR with base branch `develop`.
+         The PR title must include the ticket ID (e.g., '[{{ticket_id}}] Add new feature').
+         Link the PR to the Linear ticket (add the PR URL as a comment or attachment on the ticket).
+      6. Verify the PR passes all CI checks (GitHub Actions test-frontend and test-backend).
+         If CI checks are failing or in progress, wait for them to complete.
+         Only proceed when both test-frontend and test-backend checks are SUCCESS.
+      7. Once CI checks pass and the code is ready for review:
+         a. Call github_update_pr(repo, pr_number, ready_for_review=True) to convert draft to OPEN.
+         b. Move the Linear ticket to 'In Review' using linear_update_status.
+            CRITICAL: linear_update_status MUST be your LAST action. Do NOT post any comments, add any labels, or take any action after calling it.
     prompt: |
-      Ticket {{ticket_id}} is 'In Progress'. Branch from `develop`, write the code and tests, verify they pass, open a PR with base `develop`, link it to Linear, and move the ticket to 'In Review'. Stop after the status update — do nothing after it.
+      Ticket {{ticket_id}} is 'In Progress'. Branch from `develop`, write the code and tests, verify they pass. Create a DRAFT PR with base `develop`, link it to Linear. Wait for GitHub CI checks (test-frontend and test-backend) to pass. When both checks are SUCCESS and the code is ready, convert the draft PR to OPEN, then move the ticket to 'In Review'. Stop after the status update — do nothing after it.
 
   - agent_key: Reviewer
     toolsets:
