@@ -2681,9 +2681,12 @@ class GatewayRunner:
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "trigger":
+            return await self._handle_trigger_command(event)
+
         if canonical == "restart":
             return await self._handle_restart_command(event)
-        
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
         
@@ -4219,6 +4222,59 @@ class GatewayRunner:
         if active_agents:
             return f"⏳ Draining {active_agents} active agent(s) before restart..."
         return "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
+
+    async def _handle_trigger_command(self, event: MessageEvent) -> str:
+        """Handle /trigger <role> <ticket-id> [prompt] — manually trigger an SDLC agent.
+
+        Calls POST /trigger-agent on the webhook server, which acquires a lock and
+        dispatches the appropriate AIAgent in the background without changing Linear state.
+        """
+        import requests as _requests
+
+        args = event.get_command_args().strip()
+        if not args:
+            return (
+                "Usage: `/trigger <role> <ticket-id> [prompt]`\n"
+                "Examples:\n"
+                "  `/trigger Developer FAW-26`\n"
+                "  `/trigger Reviewer FAW-26`\n"
+                "  `/trigger QA FAW-26 Review the PR after CI passes`\n"
+                "Roles: Developer, Reviewer, QA"
+            )
+
+        parts = args.split(None, 2)
+        role = parts[0] if len(parts) >= 1 else ""
+        ticket_id = parts[1] if len(parts) >= 2 else ""
+        prompt = parts[2] if len(parts) >= 3 else None
+
+        valid_roles = {"Developer", "Reviewer", "QA"}
+        if role not in valid_roles:
+            return f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}"
+
+        if not ticket_id:
+            return "Usage: `/trigger <role> <ticket-id> [prompt]`"
+
+        webhook_url = os.environ.get("FAW_WEBHOOK_SERVER_URL", "http://localhost:8000")
+        try:
+            resp = _requests.post(
+                f"{webhook_url}/trigger-agent",
+                json={"role": role, "ticket_id": ticket_id, "prompt": prompt},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("status") == "accepted":
+                agent = data.get("agent", role)
+                ticket = data.get("ticket", ticket_id)
+                return f"✅ {agent} agent triggered for {ticket}. Check Linear for progress."
+            elif data.get("status") == "locked":
+                detail = data.get("detail", "another agent holds the lock")
+                return f"⚠️ Cannot trigger {role} for {ticket_id}: {detail}"
+            else:
+                return f"❌ Unexpected response: {data}"
+        except _requests.exceptions.ConnectionError:
+            return f"❌ Could not connect to webhook server at {webhook_url}. Is it running?"
+        except Exception as e:
+            return f"❌ Error: {e}"
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""

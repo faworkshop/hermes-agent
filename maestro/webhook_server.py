@@ -279,8 +279,17 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
     if not ticket_id:
         return _log_ignored("No ticket identifier")
 
-    actor_id = payload.get("actor", {}).get("id")
-    if LINEAR_BOT_USER_ID and actor_id == LINEAR_BOT_USER_ID and action != "update":
+    # Ignore actions performed by the bot (except "update" to In Progress, which
+    # is a backward transition requested by a Reviewer/QA agent).
+    # When an agent calls linear_update_status to move a ticket back to "In Progress",
+    # the webhook fires with actor=bot+action=update. We must NOT re-trigger the
+    # Developer in that case — the agent is correctly rejecting the PR.
+    backward_transition_to_in_progress = (
+        action == "update"
+        and new_state
+        and _normalize_linear_state_name(new_state) == "in progress"
+    )
+    if LINEAR_BOT_USER_ID and actor_id == LINEAR_BOT_USER_ID and not backward_transition_to_in_progress:
         return _log_ignored("Action performed by bot", actor_id=actor_id, action=action)
 
     new_state = state_name
@@ -335,17 +344,12 @@ async def Health():
 
 @app.post("/trigger-agent")
 async def trigger_agent(
-    role: str,
-    ticket_id: str,
-    prompt: str = None,
+    request: Request,
     background_tasks: BackgroundTasks = None,
 ):
     """Manually trigger an SDLC agent without requiring a Linear status change.
 
-    This endpoint bypasses the Linear webhook entirely — no status change needed,
-    no signature verification, no label updates.
-
-    Args:
+    Body (JSON):
         role: Which agent to run — "Developer", "Reviewer", or "QA"
         ticket_id: Linear ticket identifier, e.g. "FAW-26"
         prompt: Optional custom prompt. If omitted, a default is constructed from
@@ -355,6 +359,16 @@ async def trigger_agent(
         {"status": "accepted", "agent": role, "ticket": ticket_id}
         or {"status": "locked", "detail": "..."} if another agent holds the lock.
     """
+    try:
+        body = await request.body()
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    role = (payload.get("role") or "").strip()
+    ticket_id = (payload.get("ticket_id") or "").strip()
+    prompt = payload.get("prompt")
+
     valid_roles = {"Developer", "Reviewer", "QA"}
     if role not in valid_roles:
         raise HTTPException(
@@ -362,10 +376,8 @@ async def trigger_agent(
             detail=f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}",
         )
 
-    if not ticket_id or not ticket_id.strip():
+    if not ticket_id:
         raise HTTPException(status_code=400, detail="ticket_id is required")
-
-    ticket_id = ticket_id.strip()
 
     # Same lock-acquire pattern as the Linear webhook
     if not cm.acquire_lock(ticket_id, role):

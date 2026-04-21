@@ -161,10 +161,11 @@ TOOLSETS = {
     },
 
     "github": {
-        "description": "GitHub tools: create branches, open PRs, read diffs, resolve conflicts, assign PRs, leave review comments, get PR details/checks, approve, merge, and convert draft-to-open",
+        "description": "GitHub tools: create branches, open PRs, read diffs, resolve conflicts, assign PRs, leave review comments, add labels, get PR details/checks, approve, merge, and convert draft-to-open",
         "tools": [
             "github_create_branch", "github_open_pr", "github_read_diff",
             "github_resolve_conflict", "github_assign_pr", "github_post_review_comment",
+            "github_add_label",
             "github_get_pr", "github_get_pr_checks", "github_update_pr",
             "github_merge_pr", "github_approve_pr"
         ],
