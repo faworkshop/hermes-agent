@@ -6,6 +6,11 @@ import logging
 import asyncio
 import requests
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load GITHUB_TOKEN and other env vars from ~/.hermes/.env
+load_dotenv(Path.home() / ".hermes" / ".env")
+
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Any
 

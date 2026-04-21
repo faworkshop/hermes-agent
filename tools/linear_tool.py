@@ -40,7 +40,33 @@ def _execute_linear_query(query: str, variables: Optional[Dict[str, Any]] = None
 # -----------------------------------------------------------------------------
 
 def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
-    """Read details of a Linear ticket."""
+    """Read details of a Linear ticket.
+
+    Accepts either a Linear GlobalID (e.g., '969b83a8-0682-42f9-955e-68202c3b6c03')
+    or a human-readable identifier (e.g., 'FAW-26').
+
+    When given a human-readable identifier, resolves it via the team key and issue number:
+    - Extracts the team key (e.g., 'FAW') and issue number (e.g., '26') from 'FAW-26'
+    - Queries teams to find the team's GlobalID
+    - Filters issues by team.id + number
+    """
+    # Normalize: if ticket_id looks like a GlobalID (contains dashes, 36+ chars), use it directly
+    if isinstance(ticket_id, str) and len(ticket_id) >= 32 and "-" in ticket_id:
+        issue_id = ticket_id
+    elif isinstance(ticket_id, str) and "-" in ticket_id:
+        # Human-readable identifier like 'FAW-26' — resolve to GlobalID via team + number
+        parts = ticket_id.split("-", 1)
+        team_key = parts[0]
+        issue_number = parts[1] if len(parts) > 1 else None
+        if issue_number:
+            issue_id = _resolve_issue_id_by_team_and_number(team_key, issue_number)
+            if not issue_id:
+                return json.dumps({"success": False, "error": f"Could not resolve {ticket_id} to a Linear issue ID"})
+        else:
+            return json.dumps({"success": False, "error": f"Invalid ticket ID format: {ticket_id}"})
+    else:
+        return json.dumps({"success": False, "error": f"Invalid ticket ID format: {ticket_id}"})
+
     query = """
     query Issue($id: String!) {
       issue(id: $id) {
@@ -100,8 +126,66 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
       }
     }
     """
-    result = _execute_linear_query(query, {"id": ticket_id})
+    result = _execute_linear_query(query, {"id": issue_id})
     return json.dumps(result)
+
+
+def _resolve_issue_id_by_team_and_number(team_key: str, issue_number: str) -> str:
+    """Resolve a Linear issue GlobalID from team key + issue number (e.g., 'FAW' + '26' -> GlobalID).
+
+    Uses linear_search_tickets (which fetches recent issues) and filters client-side by identifier.
+    Falls back to fetching all issues from a team and filtering.
+    """
+    import re
+    target_identifier = f"{team_key}-{issue_number}"
+
+    # Try linear_search_tickets approach (fetches recent issues with identifier field)
+    search_query = """
+    query Issues($first: Int!) {
+      issues(first: $first, orderBy: updatedAt) {
+        nodes { id identifier number }
+      }
+    }
+    """
+    result = _execute_linear_query(search_query, {"first": 100})
+    if result.get("success"):
+        issues = result.get("data", {}).get("issues", {}).get("nodes", [])
+        for issue in issues:
+            if issue.get("identifier") == target_identifier:
+                return issue.get("id")
+
+    # Fallback: get all teams, find the team, then fetch issues by team.id
+    teams_query = """
+    query Teams($first: Int!) {
+      teams(first: $first) {
+        nodes { id key }
+      }
+    }
+    """
+    teams_result = _execute_linear_query(teams_query, {"first": 20})
+    if teams_result.get("success"):
+        teams = teams_result.get("data", {}).get("teams", {}).get("nodes", [])
+        team_id = next((t.get("id") for t in teams if t.get("key") == team_key), None)
+        if team_id:
+            # Fetch a small batch of issues from this team (updated recently)
+            team_issues_query = """
+            query TeamIssues($first: Int!, $filter: IssueFilterInput!) {
+              issues(first: $first, filter: $filter, orderBy: updatedAt) {
+                nodes { id identifier number }
+              }
+            }
+            """
+            team_result = _execute_linear_query(
+                team_issues_query,
+                {"first": 50, "filter": {"team": {"id": {"in": [team_id]}}}}
+            )
+            if team_result.get("success"):
+                team_issues = team_result.get("data", {}).get("issues", {}).get("nodes", [])
+                for issue in team_issues:
+                    if issue.get("identifier") == target_identifier:
+                        return issue.get("id")
+
+    return None
 
 def linear_read_comments(ticket_id: str, task_id: str = None) -> str:
     """Read comments from a Linear ticket."""

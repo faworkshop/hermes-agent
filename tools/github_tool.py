@@ -161,8 +161,24 @@ def github_update_pr(repo: str, pr_number: int, ready_for_review: bool = True, t
     return json.dumps(result)
 
 def github_get_pr(repo: str, pr_number: int, task_id: str = None) -> str:
-    """Get full details of a Pull Request including head/base branch info."""
+    """Get full details of a Pull Request including head/base branch info.
+
+    Normalizes GitHub API fields to common names:
+    - baseRefName: the base branch name (from base.ref)
+    - headRefName: the head branch name (from head.ref)
+    - isDraft: whether the PR is a draft
+    """
     result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
+    if isinstance(result, dict) and "success" not in result:
+        # Normalize field names for easier access
+        if "base" in result and isinstance(result["base"], dict):
+            result["baseRefName"] = result["base"].get("ref")
+            result["baseSha"] = result["base"].get("sha")
+        if "head" in result and isinstance(result["head"], dict):
+            result["headRefName"] = result["head"].get("ref")
+            result["headSha"] = result["head"].get("sha")
+        if "draft" in result:
+            result["isDraft"] = result["draft"]
     return json.dumps(result)
 
 def github_get_pr_checks(repo: str, pr_number: int, task_id: str = None) -> str:
