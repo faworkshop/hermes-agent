@@ -279,15 +279,15 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
     if not ticket_id:
         return _log_ignored("No ticket identifier")
 
-    # Ignore actions performed by the bot (except "update" to In Progress, which
-    # is a backward transition requested by a Reviewer/QA agent).
-    # When an agent calls linear_update_status to move a ticket back to "In Progress",
-    # the webhook fires with actor=bot+action=update. We must NOT re-trigger the
-    # Developer in that case — the agent is correctly rejecting the PR.
+    # When an agent calls linear_update_status to move a ticket back to "In Progress"
+    # (e.g. Reviewer rejecting a PR, QA failing a test), the webhook fires with
+    # actor=bot+action=update. Skip the lock-check for backward transitions since the
+    # prior agent has finished — Developer must be allowed to pick up the ticket again.
+    actor_id = payload.get("actor", {}).get("id")
     backward_transition_to_in_progress = (
         action == "update"
-        and new_state
-        and _normalize_linear_state_name(new_state) == "in progress"
+        and state_name
+        and _normalize_linear_state_name(state_name) == "in progress"
     )
     if LINEAR_BOT_USER_ID and actor_id == LINEAR_BOT_USER_ID and not backward_transition_to_in_progress:
         return _log_ignored("Action performed by bot", actor_id=actor_id, action=action)
@@ -311,10 +311,10 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
             normalized=state_key,
         )
 
-    # Check lock in the foreground BEFORE accepting the state change.
-    # If the ticket is already locked by a different role's in-progress agent,
-    # abort the dev operation: add needs-human label and post a comment.
-    if not cm.acquire_lock(ticket_id, role):
+    # Backward transitions (e.g. Reviewer->In Progress, QA->In Progress) skip the
+    # lock-check so Developer can immediately pick up the ticket. Forward transitions
+    # (new work) still require the lock to prevent concurrent agents.
+    if not backward_transition_to_in_progress and not cm.acquire_lock(ticket_id, role):
         logger.warning(
             "Agent %s for %s blocked: ticket is already locked by another agent. "
             "Adding needs-human label and posting comment.",
