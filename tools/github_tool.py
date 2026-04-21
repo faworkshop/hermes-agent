@@ -169,17 +169,19 @@ def github_get_pr(repo: str, pr_number: int, task_id: str = None) -> str:
     - isDraft: whether the PR is a draft
     """
     result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
-    if isinstance(result, dict) and "success" not in result:
+    # _execute_github_request returns {"success": true, "data": {...}} — always unwrap
+    pr_data = result.get("data", {}) if isinstance(result, dict) else result
+
+    if isinstance(pr_data, dict):
         # Normalize field names for easier access
-        if "base" in result and isinstance(result["base"], dict):
-            result["baseRefName"] = result["base"].get("ref")
-            result["baseSha"] = result["base"].get("sha")
-        if "head" in result and isinstance(result["head"], dict):
-            result["headRefName"] = result["head"].get("ref")
-            result["headSha"] = result["head"].get("sha")
-        if "draft" in result:
-            result["isDraft"] = result["draft"]
-    return json.dumps(result)
+        head = pr_data.get("head") or {}
+        base = pr_data.get("base") or {}
+        pr_data["baseRefName"] = base.get("ref")
+        pr_data["baseSha"] = base.get("sha")
+        pr_data["headRefName"] = head.get("ref")
+        pr_data["headSha"] = head.get("sha")
+        pr_data["isDraft"] = pr_data.get("draft")
+    return json.dumps(pr_data)
 
 def github_get_pr_checks(repo: str, pr_number: int, task_id: str = None) -> str:
     """Get the status of all CI checks (GitHub Actions, status checks) for a PR.
@@ -194,17 +196,33 @@ def github_get_pr_checks(repo: str, pr_number: int, task_id: str = None) -> str:
                       'neutral', 'skipped', 'stale', or None (if status is not completed).
     """
     # First get the PR to find the head commit SHA
-    pr_data = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
-    if isinstance(pr_data, dict) and "head" in pr_data and pr_data["head"] and "sha" in pr_data["head"]:
-        head_sha = pr_data["head"]["sha"]
-    elif isinstance(pr_data, dict) and "head_sha" in pr_data:
-        head_sha = pr_data["head_sha"]
-    else:
-        return json.dumps({"error": "Could not determine PR head commit SHA", "pr_data": pr_data})
+    # _execute_github_request returns {"success": true, "data": {...}} — unwrap it
+    pr_result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}")
+    pr_data = pr_result.get("data", {}) if isinstance(pr_result, dict) else {}
+
+    # Normalize: GitHub API returns base.ref and head.ref as branch info dicts
+    head = pr_data.get("head", {}) or {}
+    base = pr_data.get("base", {}) or {}
+    head_sha = (
+        head.get("sha")
+        or pr_data.get("head_sha")
+        or head.get("ref")  # fallback: use the ref name itself
+    )
+
+    if not head_sha:
+        return json.dumps({
+            "error": "Could not determine PR head commit SHA",
+            "pr_data": pr_data,
+            "head": head,
+        })
 
     # Get check runs for the head commit
     result = _execute_github_request("GET", f"repos/{repo}/commits/{head_sha}/check-runs")
-    return json.dumps(result)
+    # Unwrap success/data wrapper and normalize check runs
+    cr_data = result.get("data", {}) if isinstance(result, dict) else result
+    if isinstance(cr_data, dict):
+        cr_data["check_runs"] = cr_data.get("check_runs", [])
+    return json.dumps(cr_data)
 
 def github_add_label(repo: str, issue_number: int, labels: List[str], task_id: str = None) -> str:
     """Add labels to a PR or Issue. Used by Reviewer to trigger QA."""
