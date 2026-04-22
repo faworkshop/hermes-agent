@@ -48,8 +48,9 @@ pipeline:
          a. Extract the PR URL from the Linear ticket's attachments or pullRequest field.
          b. Call github_get_pr(repo, pr_number) to get the PR details.
          c. Verify baseRefName is 'develop' — NOT 'main' or any other branch.
-         d. If baseRefName is NOT 'develop', the work is NOT in the integration branch. Report this as a discrepancy in your comment and set priority to 1 (Urgent).
-         e. If the PR is MERGED, verify it was merged into 'develop'. If merged into 'main', flag this immediately.
+         d. If baseRefName is NOT 'develop' AND the PR is NOT yet merged: move the ticket to 'In Progress' to trigger the Developer agent. Developer will create a new PR against 'develop' by cherry-picking or rebasing the changes.
+         e. If the PR is MERGED into 'main' (wrong branch): move the ticket to 'In Progress' to trigger the Developer agent. Developer will cherry-pick the merged commits from `main` onto `develop`. This is an autonomous fix — do NOT escalate to human, do NOT add 'needs-human' label.
+         f. If baseRefName IS 'develop' and the PR is merged, the work is complete — no action needed.
       Do not write application code.
     prompt: |
       Ticket {{ticket_id}} has been created or moved to Backlog. Please read it, review the project roadmap and active backlog for context, ensure it has acceptance criteria, assign priority and labels, and move it to 'Todo' or 'In Progress'. Post a summary of your triage and the rationale for the priority based on current projects.
