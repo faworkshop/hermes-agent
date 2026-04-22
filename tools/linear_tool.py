@@ -67,6 +67,11 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
     else:
         return json.dumps({"success": False, "error": f"Invalid ticket ID format: {ticket_id}"})
 
+    # NOTE: pullRequest field does NOT exist on Issue type in Linear's API.
+    # PR info must be obtained from: (a) attachments (URLs contain PR number), or
+    # (b) github_get_pr directly using PR number from attachment URL.
+    # NOTE: project.slug does not exist — use project { id name } only.
+    # NOTE: attachments.contentType causes 400 — use { id title url } only.
     query = """
     query Issue($id: String!) {
       issue(id: $id) {
@@ -91,7 +96,6 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
         project {
           id
           name
-          slug
         }
         labels {
           nodes {
@@ -99,20 +103,11 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
             name
           }
         }
-        pullRequest {
-          number
-          title
-          url
-          state
-          baseRefName
-          headRefName
-        }
         attachments {
           nodes {
             id
             title
             url
-            contentType
           }
         }
         comments {
@@ -142,7 +137,7 @@ def _resolve_issue_id_by_team_and_number(team_key: str, issue_number: str) -> st
     # Try linear_search_tickets approach (fetches recent issues with identifier field)
     search_query = """
     query Issues($first: Int!) {
-      issues(first: $first, orderBy: updatedAt) {
+      issues(first: $first) {
         nodes { id identifier number }
       }
     }
@@ -169,8 +164,8 @@ def _resolve_issue_id_by_team_and_number(team_key: str, issue_number: str) -> st
         if team_id:
             # Fetch a small batch of issues from this team (updated recently)
             team_issues_query = """
-            query TeamIssues($first: Int!, $filter: IssueFilterInput!) {
-              issues(first: $first, filter: $filter, orderBy: updatedAt) {
+            query TeamIssues($first: Int!, $filter: IssueFilter!) {
+              issues(first: $first, filter: $filter) {
                 nodes { id identifier number }
               }
             }

@@ -281,16 +281,17 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
 
     # When an agent calls linear_update_status to move a ticket back to "In Progress"
     # (e.g. Reviewer rejecting a PR, QA failing a test), the webhook fires with
-    # actor=bot+action=update. Skip the lock-check for backward transitions since the
-    # prior agent has finished — Developer must be allowed to pick up the ticket again.
+    # actor=bot+action=update. We still dispatch the next agent — but skip the
+    # lock-check for backward transitions since the prior agent has finished and
+    # Developer must be allowed to pick up the ticket again.
+    # NOTE: We no longer blanket-ignore bot actions — the state mapping determines
+    # which agent should run, including forward transitions like Developer->"In Review".
     actor_id = payload.get("actor", {}).get("id")
     backward_transition_to_in_progress = (
         action == "update"
         and state_name
         and _normalize_linear_state_name(state_name) == "in progress"
     )
-    if LINEAR_BOT_USER_ID and actor_id == LINEAR_BOT_USER_ID and not backward_transition_to_in_progress:
-        return _log_ignored("Action performed by bot", actor_id=actor_id, action=action)
 
     new_state = state_name
     if not new_state:
@@ -314,22 +315,35 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
     # Backward transitions (e.g. Reviewer->In Progress, QA->In Progress) skip the
     # lock-check so Developer can immediately pick up the ticket. Forward transitions
     # (new work) still require the lock to prevent concurrent agents.
-    if not backward_transition_to_in_progress and not cm.acquire_lock(ticket_id, role):
-        logger.warning(
-            "Agent %s for %s blocked: ticket is already locked by another agent. "
-            "Adding needs-human label and posting comment.",
-            role, ticket_id,
-        )
-        _add_needs_human_label(ticket_id, role)
-        _post_locked_comment(ticket_id, role, new_state)
-        return {
-            "status": "locked",
-            "detail": (
-                f"Cannot start {role} agent for {ticket_id}: "
-                f"ticket is currently locked by an in-progress agent. "
-                f"A 'needs-human' label has been added and a comment posted."
-            ),
-        }
+    # ALSO skip the lock-check if the current lock holder is the SAME agent — the agent
+    # holds the lock for the duration of its run and is performing a state transition
+    # (e.g. Reviewer calling linear_update_status to move to 'Ready For QA'). The lock
+    # will be released by the finally block when the agent finishes.
+    current_lock = cm.get_lock(ticket_id)
+    if not backward_transition_to_in_progress:
+        if current_lock and current_lock.get("role") != role:
+            # Lock held by a DIFFERENT agent. For forward transitions (e.g. Reviewer->QA),
+            # atomically release the old lock and acquire for the new agent — the prior
+            # agent is finishing its run and the Linear webhook fires before it releases.
+            # For true concurrent conflict (two different agents for same state), block.
+            logger.info(
+                "Agent %s for %s: releasing lock held by '%s' and acquiring for '%s' "
+                "(forward transition from %s's state to %s's state).",
+                role, ticket_id, current_lock.get("role"), role,
+                current_lock.get("role"), role,
+            )
+            cm.release_and_acquire(ticket_id, current_lock.get("role"), role)
+        elif current_lock and current_lock.get("role") == role:
+            # Same agent already holds the lock — skip re-acquire, let it proceed.
+            # This covers the race: Reviewer calls linear_update_status -> webhook fires
+            # -> same agent tries to dispatch -> skip lock-check.
+            logger.info(
+                "Agent %s for %s already holds the lock — skipping lock-check for "
+                "same-agent transition to '%s'.",
+                role, ticket_id, new_state,
+            )
+        # else: no lock exists — acquire it
+        cm.acquire_lock(ticket_id, role)
 
     prompt = f"Ticket {ticket_id} has moved to '{new_state}'. Please perform your duties as {role}."
     logger.info("Linear webhook accepted: ticket=%s state=%r -> agent=%s", ticket_id, new_state, role)

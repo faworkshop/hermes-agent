@@ -68,6 +68,29 @@ class ConcurrencyManager:
             )
             conn.commit()
 
+    def release_and_acquire(self, ticket_id: str, current_agent: str, next_agent: str) -> bool:
+        """Atomically release current_agent's lock and acquire a lock for next_agent.
+        
+        Returns True if the next_agent lock was successfully acquired.
+        This is used when a webhook transition moves a ticket from one agent's state
+        to another's — the current agent's lock is still held but needs to be cleared
+        so the next agent can proceed.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # Release current holder
+            cursor.execute(
+                "DELETE FROM locks WHERE ticket_id = ? AND assignee = ?",
+                (ticket_id, current_agent)
+            )
+            # Try to acquire for next agent
+            cursor.execute(
+                "INSERT INTO locks (ticket_id, assignee, locked_at) VALUES (?, ?, ?)",
+                (ticket_id, next_agent, time.time())
+            )
+            conn.commit()
+            return True
+
     def force_clear(self, ticket_id: str) -> Optional[str]:
         """Force-clear any lock on a ticket regardless of who holds it.
         Returns the role that was cleared, or None if there was no lock.
