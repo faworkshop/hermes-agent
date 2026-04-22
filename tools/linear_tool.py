@@ -467,7 +467,11 @@ registry.register(
                 },
                 "status": {
                     "type": "string",
-                    "description": "The new status (e.g., 'Todo', 'In Progress', 'In Review', 'Ready For QA', 'QA Testing', 'Ready For Delivery')."
+                    "description": (
+                        "The new Linear workflow state name for this issue's team (must exist on the team). "
+                        "Pipeline examples: 'Todo', 'In Progress', 'In Review', 'Ready For QA', 'Ready For Delivery'. "
+                        "Human-only in this SDLC — agents must not set: 'Approved For Delivery', 'Done' (production)."
+                    )
                 }
             },
             "required": ["ticket_id", "status"]

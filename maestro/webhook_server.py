@@ -96,6 +96,9 @@ _STATE_AGENT_MAPPING_RAW: Dict[str, str] = {
     "In Review": "Reviewer",
     "Ready For QA": "QA",
 }
+# Intentionally unmapped (no agent webhook): Ready For Delivery, Approved For Delivery, Done —
+# see sdlc_roles.yaml / common_system. QA ends automation at Ready For Delivery; humans advance
+# Approved For Delivery and Done (production).
 
 
 def _normalize_linear_state_name(name: str) -> str:
