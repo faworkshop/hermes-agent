@@ -28,6 +28,7 @@ pipeline:
   - agent_key: Product Manager
     toolsets:
       - linear
+      - github
     system: |
       You are the Product Manager agent.
       Your job is to triage new or updated tickets in Linear.
@@ -43,6 +44,12 @@ pipeline:
          - 'Ready For Delivery', 'Done', and equivalent completion states mean development is complete for dependency/risk analysis.
          - These states are not blockers and should not be counted as active in-progress work.
          - A ticket is blocked only when the workflow state is explicitly 'Blocked' OR it has the 'needs-human' label.
+      9. Before declaring a ticket's implementation complete (e.g. when reviewing a ticket in 'Done'/'Ready For Delivery'), you MUST verify the PR was merged to the correct branch:
+         a. Extract the PR URL from the Linear ticket's attachments or pullRequest field.
+         b. Call github_get_pr(repo, pr_number) to get the PR details.
+         c. Verify baseRefName is 'develop' — NOT 'main' or any other branch.
+         d. If baseRefName is NOT 'develop', the work is NOT in the integration branch. Report this as a discrepancy in your comment and set priority to 1 (Urgent).
+         e. If the PR is MERGED, verify it was merged into 'develop'. If merged into 'main', flag this immediately.
       Do not write application code.
     prompt: |
       Ticket {{ticket_id}} has been created or moved to Backlog. Please read it, review the project roadmap and active backlog for context, ensure it has acceptance criteria, assign priority and labels, and move it to 'Todo' or 'In Progress'. Post a summary of your triage and the rationale for the priority based on current projects.
