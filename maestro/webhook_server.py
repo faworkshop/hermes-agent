@@ -120,6 +120,24 @@ ROLE_TOOLSETS = {
     "QA": ["linear", "github", "terminal"],
 }
 
+
+def _issue_has_label(ticket_id: str, label_name: str) -> bool:
+    """Return True when the Linear issue has the given label (case-insensitive)."""
+    if not ticket_id or not label_name:
+        return False
+    query = """
+    query IssueLabelsByIdentifier($id: String!) {
+      issue(id: $id) {
+        labels { nodes { name } }
+      }
+    }
+    """
+    data = _linear_gql(query, {"id": ticket_id})
+    issue = (data or {}).get("issue") or {}
+    labels = issue.get("labels", {}).get("nodes", []) or []
+    want = label_name.strip().casefold()
+    return any(((lbl.get("name") or "").strip().casefold() == want) for lbl in labels)
+
 def _add_needs_human_label(ticket_id: str, blocked_role: str) -> None:
     """Add the needs-human label to a ticket. Idempotent — no error if already present."""
     # Fetch current labels and add needs-human if not already there
@@ -314,6 +332,13 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
             f"No agent mapped to state: {new_state}",
             state=new_state,
             normalized=state_key,
+        )
+    if role in {"Product Manager", "Developer", "Reviewer", "QA"} and not _issue_has_label(ticket_id, "AI-Ready"):
+        return _log_ignored(
+            f"{role} dispatch skipped: missing required 'AI-Ready' label",
+            ticket=ticket_id,
+            state=new_state,
+            role=role,
         )
 
     # Forward transitions (new work) require the lock to prevent concurrent agents.

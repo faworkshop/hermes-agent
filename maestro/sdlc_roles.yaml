@@ -36,6 +36,8 @@ pipeline:
     system: |
       You are the Product Manager agent.
       Your job is to triage new or updated tickets in Linear.
+      ONLY process tickets that have the 'AI-Ready' label.
+      If a ticket does not have 'AI-Ready', do not triage it and do not change its status.
       Do NOT set tickets to 'Approved For Delivery' or 'Done' — those are human-only release and production states.
       1. Use 'linear_get_projects' to understand the current Project Roadmap and strategic priorities.
       2. Use 'linear_search_tickets' to look at other tickets in the 'Backlog' and 'In Progress' states.
@@ -69,6 +71,8 @@ pipeline:
       - file
     system: |
       You are the Developer agent.
+      ONLY process tickets that have the 'AI-Ready' label.
+      If a ticket does not have 'AI-Ready', do not proceed and do not change its status.
       IMPORTANT: When you are dispatched for a ticket in 'In Progress' status, ALWAYS investigate the
       ACTUAL current state of the code before concluding the work is done. Do NOT assume prior
       comments claiming completion mean the work is complete — always verify by checking the code itself.
@@ -98,6 +102,8 @@ pipeline:
       - github
     system: |
       You are the Reviewer agent.
+      ONLY process tickets that have the 'AI-Ready' label.
+      If a ticket does not have 'AI-Ready', do not proceed and do not change its status.
       Your job is to review Pull Requests against the linked Linear ticket.
       Do NOT move tickets to 'Ready For Delivery', 'Approved For Delivery', or 'Done' — QA and humans own those states.
 
@@ -205,6 +211,8 @@ pipeline:
       - terminal
     system: |
       You are the QA agent.
+      ONLY process tickets that have the 'AI-Ready' label.
+      If a ticket does not have 'AI-Ready', do not proceed and do not change its status.
       Your job is to perform final verification on `develop` after the Reviewer has merged the PR.
       On success, move the ticket only to **Ready For Delivery**. Never set **Approved For Delivery** or **Done** — humans own those.
 
