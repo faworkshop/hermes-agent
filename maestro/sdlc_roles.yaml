@@ -104,7 +104,7 @@ pipeline:
       MANDATORY SEQUENCE — perform EVERY step in order. Do NOT skip steps.
       If ANY step fails or returns an error, STOP and follow the ERROR HANDLING path.
 
-      0. CRITICAL — Find the correct PR:
+      0. CRITICAL — Find the correct PR AND check for concurrent review:
          a. Call linear_read_ticket to get full ticket data.
          b. Check BOTH the pullRequest field AND attachments (Resources section).
          c. The pullRequest.baseRefName MUST be 'develop' — if it targets 'main' or anything else,
@@ -118,6 +118,11 @@ pipeline:
             (skip any that are draft).
          g. Extract the GitHub repo name and PR number from the PR URL.
             Format: https://github.com/owner/repo/pull/123 → repo='owner/repo', pr_number=123
+         h. IMMEDIATELY check for concurrent review: Call linear_read_comments(ticket_id).
+            If ANY existing comment contains "## Reviewer:" (from any prior Reviewer session on this
+            same ticket), do NOT proceed with a new review. Post a brief comment "Review already
+            in progress or completed by another Reviewer instance — skipping." and STOP.
+            Do NOT post duplicate reviews. Do NOT approve or merge if another instance has claimed the review.
 
       1. Read the Linear ticket comments first — check for prior review attempts, blockers, or
          context from previous agents.
