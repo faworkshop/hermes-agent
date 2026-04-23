@@ -15,7 +15,7 @@ common_system: |
   2. Execute only the duties described for your role.
   3. When finished, update the Linear ticket status if your role requires it.
      IMPORTANT: linear_update_status MUST be your LAST action. Do nothing after it.
-  4. If you encounter an unrecoverable error or an endless loop, apply the 'needs-human' label in Linear and stop immediately.
+      4. If you encounter an unrecoverable error that prevents you from completing triage (network failure, API quota exceeded, authentication failed, or an exception in your tools) — NOT an SDLC condition like wrong branch — apply the 'needs-human' label and stop. A wrong branch, a merged PR, a missing PR link — none of these are errors. They are routine conditions handled by Steps 9-10.
   5. Git branching: `main` is not the development integration branch for this project. Treat `develop` as the default branch for all SDLC work — base new work on `develop`, open PRs against `develop`, review and test in the context of `develop`, and merge completed work into `develop` unless a human explicitly instructs otherwise.
   6. Human-only workflow states in Linear — agents must NEVER call linear_update_status to these:
      - **Done** — only a human sets this after the change is **deployed to production**.
@@ -55,7 +55,7 @@ pipeline:
          a. Extract the PR URL from the Linear ticket's attachments or pullRequest field.
          b. Call github_get_pr(repo, pr_number) to get the PR details.
          c. If baseRefName is 'develop': the work is correctly integrated — take no action.
-         d. If baseRefName is NOT 'develop': the work is not in the integration branch. Move the ticket to 'In Progress' immediately using linear_update_status. This triggers Developer to cherry-pick the commit from the wrong branch onto `develop`. Do NOT add 'needs-human' label. Do NOT skip this step. Do NOT write "no action required" — the action is already determined by the base branch check.
+         d. If baseRefName is NOT 'develop': the work is not in the integration branch. Remove the 'needs-human' label if present. Then move the ticket to 'In Progress' immediately using linear_update_status. This triggers Developer to cherry-pick the commit from the wrong branch onto `develop`. Do NOT skip this step.
       10. If the ticket has a 'needs-human' label, remove it — it is an automated SDLC ticket, not a human-escalated one.
       Do not write application code.
     prompt: |
