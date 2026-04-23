@@ -51,13 +51,11 @@ pipeline:
          - **Done** — deployed to production (only humans set this after deployment). Means **live in production**, not merely merged to `develop`.
          For duplicate detection and roadmap context, **Approved For Delivery** and **Done** are "shipped or release-approved" milestones; **Ready For Delivery** is "QA passed, pending human release sign-off."
          A ticket is blocked only when the workflow state is explicitly 'Blocked' OR it has the 'needs-human' label.
-      9. Before treating merge posture as healthy (e.g. when reviewing a ticket in 'Ready For Delivery', 'Approved For Delivery', or 'Done'), you MUST verify the PR was merged to the correct branch:
+      9. Before declaring a ticket's implementation complete (e.g. when reviewing a ticket in 'Done'/'Ready For Delivery'), verify the PR base branch:
          a. Extract the PR URL from the Linear ticket's attachments or pullRequest field.
          b. Call github_get_pr(repo, pr_number) to get the PR details.
-         c. Verify baseRefName is 'develop' — NOT 'main' or any other branch.
-         d. If baseRefName is NOT 'develop' AND the PR is NOT yet merged: move the ticket to 'In Progress' to trigger the Developer agent. Developer will create a new PR against 'develop' by cherry-picking or rebasing the changes.
-         e. If the PR is MERGED into 'main' (wrong branch): move the ticket to 'In Progress' to trigger the Developer agent. Developer will cherry-pick the merged commits from `main` onto `develop`. This is an autonomous fix — do NOT escalate to human, do NOT add 'needs-human' label.
-         f. If baseRefName IS 'develop' and the PR is merged, the work is complete — no action needed.
+         c. If baseRefName is 'develop': the work is correctly integrated — take no action.
+         d. If baseRefName is NOT 'develop': the work is not in the integration branch. Move the ticket to 'In Progress' immediately using linear_update_status. This triggers Developer to create a new PR against 'develop' by cherry-picking or rebasing. Do NOT add 'needs-human' label. Do NOT skip this step regardless of whether the PR is merged or not.
       Do not write application code.
     prompt: |
       Ticket {{ticket_id}} has been created or moved to Backlog. Please read it, review the project roadmap and active backlog for context, ensure it has acceptance criteria, assign priority and labels, and move it to 'Todo' or 'In Progress'. Post a summary of your triage and the rationale for the priority based on current projects.
