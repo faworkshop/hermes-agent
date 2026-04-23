@@ -191,7 +191,7 @@ def verify_linear_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(computed_signature, signature)
 
 
-async def run_agent_task(role: str, ticket_id: str, prompt: str):
+async def run_agent_task(role: str, ticket_id: str, prompt: str, session_id: str = None):
     if role in ["Developer", "Reviewer", "QA"]:
         retries = cm.get_retry_count(ticket_id)
         if retries >= 3:
@@ -231,6 +231,7 @@ async def run_agent_task(role: str, ticket_id: str, prompt: str):
             credential_pool=rt.get("credential_pool"),
             enabled_toolsets=enabled_toolsets,
             quiet_mode=False,
+            session_id=session_id,
         )
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
@@ -315,13 +316,13 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
             normalized=state_key,
         )
 
-    # Backward transitions (e.g. Reviewer->In Progress, QA->In Progress) skip the
-    # lock-check so Developer can immediately pick up the ticket. Forward transitions
-    # (new work) still require the lock to prevent concurrent agents.
-    # ALSO skip the lock-check if the current lock holder is the SAME agent — the agent
-    # holds the lock for the duration of its run and is performing a state transition
-    # (e.g. Reviewer calling linear_update_status to move to 'Ready For QA'). The lock
-    # will be released by the finally block when the agent finishes.
+    # Forward transitions (new work) require the lock to prevent concurrent agents.
+    # Backward transitions (to In Progress) skip the lock-check so Developer can pick up.
+    # We track BOTH role AND session_id — the session_id is generated here in the
+    # foreground (before background dispatch) so the lock is held by a known session.
+    # Only the SAME session can re-acquire for the same role. Different sessions block.
+    import uuid
+    session_id = f"{ticket_id}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     current_lock = cm.get_lock(ticket_id)
     if not backward_transition_to_in_progress:
         if current_lock and current_lock.get("role") != role:
@@ -335,22 +336,42 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
                 role, ticket_id, current_lock.get("role"), role,
                 current_lock.get("role"), role,
             )
-            cm.release_and_acquire(ticket_id, current_lock.get("role"), role)
+            cm.release_and_acquire(ticket_id, current_lock.get("role"), role, session_id)
         elif current_lock and current_lock.get("role") == role:
-            # Same agent already holds the lock — skip re-acquire, let it proceed.
-            # This covers the race: Reviewer calls linear_update_status -> webhook fires
-            # -> same agent tries to dispatch -> skip lock-check.
-            logger.info(
-                "Agent %s for %s already holds the lock — skipping lock-check for "
-                "same-agent transition to '%s'.",
-                role, ticket_id, new_state,
-            )
-        # else: no lock exists — acquire it
-        cm.acquire_lock(ticket_id, role)
+            # Same role holds the lock — but check if it's the SAME session (same process
+            # re-triggering its own action) vs a DIFFERENT session trying to dispatch.
+            # Only allow re-dispatch if the session_id matches the lock holder.
+            lock_session = current_lock.get("session_id")
+            if session_id is not None and lock_session is not None and session_id == lock_session:
+                # Same session re-triggering — allow (intended: agent calls update_status,
+                # its own webhook fires before lock released, it re-acquires its own lock).
+                logger.info(
+                    "Agent %s for %s already holds the lock (session %s) — "
+                    "same session re-trigger, skipping lock-check.",
+                    role, ticket_id, session_id,
+                )
+            else:
+                # Different session trying to dispatch while this role is already working —
+                # block entirely. This prevents two Reviewer instances from running
+                # concurrently when Developer double-fires the same state transition.
+                logger.info(
+                    "Agent %s for %s: CANNOT DISPATCH — role already held by session '%s', "
+                    "incoming session '%s'. Blocking to prevent concurrent %s instances.",
+                    role, ticket_id, lock_session, session_id, role,
+                )
+                return _log_ignored(
+                    f"Role '{role}' already locked by session '{lock_session}' — "
+                    f"incoming session '{session_id}' is blocked. "
+                    f"Ticket must complete current review before re-dispatch.",
+                    ticket=ticket_id, role=role, state=new_state,
+                )
+        else:
+            # No lock exists — acquire it
+            cm.acquire_lock(ticket_id, role, session_id)
 
     prompt = f"Ticket {ticket_id} has moved to '{new_state}'. Please perform your duties as {role}."
     logger.info("Linear webhook accepted: ticket=%s state=%r -> agent=%s", ticket_id, new_state, role)
-    background_tasks.add_task(run_agent_task, role, ticket_id, prompt)
+    background_tasks.add_task(run_agent_task, role, ticket_id, prompt, session_id)
     return {"status": "accepted", "agent": role, "ticket": ticket_id}
 
 

@@ -17,7 +17,8 @@ class ConcurrencyManager:
                 CREATE TABLE IF NOT EXISTS locks (
                     ticket_id TEXT PRIMARY KEY,
                     assignee TEXT,
-                    locked_at REAL
+                    locked_at REAL,
+                    session_id TEXT
                 )
             """)
             conn.execute("""
@@ -28,7 +29,7 @@ class ConcurrencyManager:
             """)
             conn.commit()
 
-    def acquire_lock(self, ticket_id: str, agent_name: str, timeout: float = 1800.0) -> bool:
+    def acquire_lock(self, ticket_id: str, agent_name: str, session_id: str = None, timeout: float = 1800.0) -> bool:
         """Try to acquire a lock for a ticket. Stale locks (older than `timeout` seconds) are auto-expired."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -53,8 +54,8 @@ class ConcurrencyManager:
                     return False
 
             cursor.execute(
-                "INSERT INTO locks (ticket_id, assignee, locked_at) VALUES (?, ?, ?)",
-                (ticket_id, agent_name, time.time())
+                "INSERT INTO locks (ticket_id, assignee, locked_at, session_id) VALUES (?, ?, ?, ?)",
+                (ticket_id, agent_name, time.time(), session_id)
             )
             conn.commit()
             return True
@@ -68,14 +69,8 @@ class ConcurrencyManager:
             )
             conn.commit()
 
-    def release_and_acquire(self, ticket_id: str, current_agent: str, next_agent: str) -> bool:
-        """Atomically release current_agent's lock and acquire a lock for next_agent.
-        
-        Returns True if the next_agent lock was successfully acquired.
-        This is used when a webhook transition moves a ticket from one agent's state
-        to another's — the current agent's lock is still held but needs to be cleared
-        so the next agent can proceed.
-        """
+    def release_and_acquire(self, ticket_id: str, current_agent: str, next_agent: str, next_session_id: str = None) -> bool:
+        """Atomically release current_agent's lock and acquire a lock for next_agent."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             # Release current holder
@@ -85,8 +80,8 @@ class ConcurrencyManager:
             )
             # Try to acquire for next agent
             cursor.execute(
-                "INSERT INTO locks (ticket_id, assignee, locked_at) VALUES (?, ?, ?)",
-                (ticket_id, next_agent, time.time())
+                "INSERT INTO locks (ticket_id, assignee, locked_at, session_id) VALUES (?, ?, ?, ?)",
+                (ticket_id, next_agent, time.time(), next_session_id)
             )
             conn.commit()
             return True
@@ -110,10 +105,10 @@ class ConcurrencyManager:
         """Return lock info for a ticket, or None if unlocked."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT assignee, locked_at FROM locks WHERE ticket_id = ?", (ticket_id,))
+            cursor.execute("SELECT assignee, locked_at, session_id FROM locks WHERE ticket_id = ?", (ticket_id,))
             row = cursor.fetchone()
             if row:
-                return {"role": row[0], "acquired_at": row[1]}
+                return {"role": row[0], "acquired_at": row[1], "session_id": row[2]}
             return None
 
     def get_retry_count(self, ticket_id: str) -> int:
