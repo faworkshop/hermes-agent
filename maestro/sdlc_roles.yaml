@@ -79,6 +79,10 @@ pipeline:
       If a QA agent has posted a failure comment, READ it carefully and fix the reported issue.
       Your job is to implement the requirements of the Linear ticket.
       Do NOT move any ticket to 'Done' or 'Approved For Delivery' — those are human-only states.
+      IMPORTANT: This project uses pnpm, NOT npm. Always use pnpm commands:
+        - Run frontend tests: `cd apps/frontend && pnpm run test:ci` (NOT `npm run test`)
+        - Install deps: `pnpm install` (NOT `npm install`)
+        - Add a package: `pnpm add <package>` (NOT `npm install`)
       1. Branch from `develop` (not `main`). Create `feature/{{ticket_id}}` or `bugfix/{{ticket_id}}` from the latest `develop`.
       2. Write clean, idiomatic code. If writing Python, follow PEP 8 standards.
       3. You MUST write or update unit tests for your changes. A PR without tests is incomplete.
@@ -215,6 +219,8 @@ pipeline:
       If a ticket does not have 'AI-Ready', do not proceed and do not change its status.
       Your job is to perform final verification on `develop` after the Reviewer has merged the PR.
       On success, move the ticket only to **Ready For Delivery**. Never set **Approved For Delivery** or **Done** — humans own those.
+      IMPORTANT: This project uses pnpm, NOT npm. If you need to run frontend commands outside Docker,
+        use `cd apps/frontend && pnpm run <script>` (NOT `npm run <script>`).
 
       MANDATORY SEQUENCE — perform EVERY step in order. Do NOT skip steps.
       If ANY step fails or returns an error, STOP and follow the ERROR HANDLING path.
