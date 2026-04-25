@@ -1,9 +1,12 @@
 import os
+import re
 import hmac
 import hashlib
 import json
 import logging
 import asyncio
+import time
+import uuid
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
@@ -14,7 +17,7 @@ load_dotenv(Path.home() / ".hermes" / ".env")
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, Query
 
 from agent.concurrency import ConcurrencyManager
 from run_agent import AIAgent
@@ -55,6 +58,8 @@ if not logger.handlers:
 
 app = FastAPI(title="Hermes Webhook Server")
 cm = ConcurrencyManager()
+_worker_tasks: dict[str, asyncio.Task] = {}
+_worker_stop_event = asyncio.Event()
 
 LINEAR_WEBHOOK_SECRET=os.getenv("LINEAR_WEBHOOK_SECRET") or os.getenv("LINEAR_HMAC_SECRET")
 LINEAR_BOT_USER_ID = os.getenv("LINEAR_BOT_USER_ID")
@@ -121,18 +126,65 @@ ROLE_TOOLSETS = {
 }
 
 
-def _issue_has_label(ticket_id: str, label_name: str) -> bool:
-    """Return True when the Linear issue has the given label (case-insensitive)."""
-    if not ticket_id or not label_name:
+def _linear_issue_uuid_from_payload(data: dict) -> str | None:
+    """Return Linear GraphQL issue UUID from webhook ``data`` (``id`` field), if present."""
+    raw = (data.get("id") or "").strip() if isinstance(data, dict) else ""
+    return raw or None
+
+
+def _linear_issue_uuid_from_identifier(identifier: str) -> str | None:
+    """Resolve issue UUID from human identifier (e.g. ``FAW-34``) via Linear API."""
+    if not identifier or not LINEAR_API_KEY:
+        return None
+    m = re.match(r"^([A-Za-z0-9]+)-(\d+)$", identifier.strip())
+    if not m:
+        return None
+    team_key, num_str = m.group(1), m.group(2)
+    try:
+        num = float(num_str)
+    except ValueError:
+        return None
+    query = """
+    query IssueByTeamNumber($teamKey: String!, $number: Float!) {
+      issues(filter: { team: { key: { eq: $teamKey } }, number: { eq: $number } }, first: 1) {
+        nodes { id }
+      }
+    }
+    """
+    gql_data = _linear_gql(query, {"teamKey": team_key, "number": num})
+    nodes = (gql_data or {}).get("issues", {}).get("nodes") or []
+    if not nodes:
+        return None
+    out = (nodes[0].get("id") or "").strip()
+    return out or None
+
+
+def _linear_issue_uuid_for_api(data: dict, identifier: str | None) -> str | None:
+    """Issue UUID for GraphQL ``issue(id:)`` — never use human identifier as ``id``."""
+    u = _linear_issue_uuid_from_payload(data)
+    if u:
+        return u
+    if identifier:
+        return _linear_issue_uuid_from_identifier(identifier)
+    return None
+
+
+def _issue_has_label(linear_issue_uuid: str, label_name: str) -> bool:
+    """Return True when the Linear issue has the given label (case-insensitive).
+
+    ``linear_issue_uuid`` must be the Linear issue **UUID** (webhook ``data.id``).
+    GraphQL ``issue(id:)`` does not accept team identifiers like ``FAW-34``.
+    """
+    if not linear_issue_uuid or not label_name:
         return False
     query = """
-    query IssueLabelsByIdentifier($id: String!) {
+    query IssueLabelsById($id: String!) {
       issue(id: $id) {
         labels { nodes { name } }
       }
     }
     """
-    data = _linear_gql(query, {"id": ticket_id})
+    data = _linear_gql(query, {"id": linear_issue_uuid})
     issue = (data or {}).get("issue") or {}
     labels = issue.get("labels", {}).get("nodes", []) or []
     want = label_name.strip().casefold()
@@ -209,12 +261,12 @@ def verify_linear_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(computed_signature, signature)
 
 
-async def run_agent_task(role: str, ticket_id: str, prompt: str, session_id: str = None):
+async def run_agent_task(role: str, ticket_id: str, prompt: str, session_id: str = None) -> bool:
     if role in ["Developer", "Reviewer", "QA"]:
         retries = cm.get_retry_count(ticket_id)
         if retries >= 3:
             logger.error(f"🚨 Circuit Breaker Tripped for {ticket_id}. Max retries reached.")
-            return
+            return False
 
     # Lock already acquired in the foreground before this background task was queued.
     # Skip the duplicate acquire here — just release it when done.
@@ -258,8 +310,72 @@ async def run_agent_task(role: str, ticket_id: str, prompt: str, session_id: str
         )
     except Exception as e:
         logger.error(f"Error running {role} Agent for {ticket_id}: {e}")
+        return False
     finally:
         cm.release_lock(ticket_id, role)
+    return True
+
+
+def _queue_roles() -> list[str]:
+    cfg = load_sdlc_config()
+    roles: list[str] = []
+    for step in cfg.get("pipeline", []):
+        role = (step.get("agent_key") or "").strip()
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
+async def _agent_worker(role: str) -> None:
+    """Continuously process queued tasks for a single role."""
+    logger.info("Starting queue worker for role=%s", role)
+    while not _worker_stop_event.is_set():
+        worker_session_id = f"{role}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        task = cm.claim_next_task(role, session_id=worker_session_id)
+        if not task:
+            await asyncio.sleep(0.8)
+            continue
+
+        task_id = int(task["id"])
+        ticket_id = str(task["ticket_id"])
+        prompt = str(task["prompt"])
+        session_id = str(task.get("session_id") or worker_session_id)
+
+        if not cm.acquire_lock(ticket_id, role, session_id=session_id):
+            cm.requeue_task(
+                task_id,
+                delay_seconds=20.0,
+                error=f"Ticket lock busy for role={role}, ticket={ticket_id}",
+            )
+            continue
+
+        try:
+            ok = await run_agent_task(role, ticket_id, prompt, session_id=session_id)
+            cm.complete_task(task_id, success=ok, error=None if ok else "Agent run failed")
+        except Exception as exc:
+            logger.error("Worker %s failed task %s: %s", role, task_id, exc, exc_info=True)
+            cm.complete_task(task_id, success=False, error=str(exc))
+    logger.info("Stopped queue worker for role=%s", role)
+
+
+@app.on_event("startup")
+async def _startup_workers() -> None:
+    _worker_stop_event.clear()
+    for role in _queue_roles():
+        if role in _worker_tasks and not _worker_tasks[role].done():
+            continue
+        _worker_tasks[role] = asyncio.create_task(_agent_worker(role))
+
+
+@app.on_event("shutdown")
+async def _shutdown_workers() -> None:
+    _worker_stop_event.set()
+    tasks = [t for t in _worker_tasks.values() if not t.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _worker_tasks.clear()
 
 
 def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
@@ -268,7 +384,7 @@ def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
 
 
 @app.post("/linear-webhook")
-async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
+async def linear_webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("linear-signature")
 
@@ -333,71 +449,56 @@ async def linear_webhook(request: Request, background_tasks: BackgroundTasks):
             state=new_state,
             normalized=state_key,
         )
-    if role in {"Product Manager", "Developer", "Reviewer", "QA"} and not _issue_has_label(ticket_id, "AI-Ready"):
+
+    linear_issue_uuid = _linear_issue_uuid_for_api(data, ticket_id)
+    if role in {"Product Manager", "Developer", "Reviewer", "QA"}:
+        if not linear_issue_uuid:
+            logger.warning(
+                "Cannot resolve Linear issue UUID for identifier=%r — skipping AI-Ready check "
+                "would be unsafe; dispatch blocked. Ensure webhook payload includes data.id.",
+                ticket_id,
+            )
+            return _log_ignored(
+                "Cannot resolve Linear issue id for label check",
+                ticket=ticket_id,
+                state=new_state,
+                role=role,
+            )
+        if not _issue_has_label(linear_issue_uuid, "AI-Ready"):
+            return _log_ignored(
+                f"{role} dispatch skipped: missing required 'AI-Ready' label (or Linear API returned no labels)",
+                ticket=ticket_id,
+                linear_issue_id=linear_issue_uuid[:8] + "…",
+                state=new_state,
+                role=role,
+            )
+
+    dedup_key = f"{ticket_id}:{role}:{state_key}"
+    prompt = f"Ticket {ticket_id} has moved to '{new_state}'. Please perform your duties as {role}."
+    created, task_row = cm.enqueue_task(
+        ticket_id,
+        role,
+        prompt,
+        dedup_key=dedup_key,
+        source_state=state_key,
+    )
+    if not created:
         return _log_ignored(
-            f"{role} dispatch skipped: missing required 'AI-Ready' label",
+            "Duplicate task already queued/running",
             ticket=ticket_id,
-            state=new_state,
             role=role,
+            dedup_key=dedup_key,
+            task_id=task_row.get("id") if task_row else None,
         )
 
-    # Forward transitions (new work) require the lock to prevent concurrent agents.
-    # Backward transitions (to In Progress) skip the lock-check so Developer can pick up.
-    # We track BOTH role AND session_id — the session_id is generated here in the
-    # foreground (before background dispatch) so the lock is held by a known session.
-    # Only the SAME session can re-acquire for the same role. Different sessions block.
-    import uuid
-    session_id = f"{ticket_id}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    current_lock = cm.get_lock(ticket_id)
-    if not backward_transition_to_in_progress:
-        if current_lock and current_lock.get("role") != role:
-            # Lock held by a DIFFERENT agent. For forward transitions (e.g. Reviewer->QA),
-            # atomically release the old lock and acquire for the new agent — the prior
-            # agent is finishing its run and the Linear webhook fires before it releases.
-            # For true concurrent conflict (two different agents for same state), block.
-            logger.info(
-                "Agent %s for %s: releasing lock held by '%s' and acquiring for '%s' "
-                "(forward transition from %s's state to %s's state).",
-                role, ticket_id, current_lock.get("role"), role,
-                current_lock.get("role"), role,
-            )
-            cm.release_and_acquire(ticket_id, current_lock.get("role"), role, session_id)
-        elif current_lock and current_lock.get("role") == role:
-            # Same role holds the lock — but check if it's the SAME session (same process
-            # re-triggering its own action) vs a DIFFERENT session trying to dispatch.
-            # Only allow re-dispatch if the session_id matches the lock holder.
-            lock_session = current_lock.get("session_id")
-            if session_id is not None and lock_session is not None and session_id == lock_session:
-                # Same session re-triggering — allow (intended: agent calls update_status,
-                # its own webhook fires before lock released, it re-acquires its own lock).
-                logger.info(
-                    "Agent %s for %s already holds the lock (session %s) — "
-                    "same session re-trigger, skipping lock-check.",
-                    role, ticket_id, session_id,
-                )
-            else:
-                # Different session trying to dispatch while this role is already working —
-                # block entirely. This prevents two Reviewer instances from running
-                # concurrently when Developer double-fires the same state transition.
-                logger.info(
-                    "Agent %s for %s: CANNOT DISPATCH — role already held by session '%s', "
-                    "incoming session '%s'. Blocking to prevent concurrent %s instances.",
-                    role, ticket_id, lock_session, session_id, role,
-                )
-                return _log_ignored(
-                    f"Role '{role}' already locked by session '{lock_session}' — "
-                    f"incoming session '{session_id}' is blocked. "
-                    f"Ticket must complete current review before re-dispatch.",
-                    ticket=ticket_id, role=role, state=new_state,
-                )
-        else:
-            # No lock exists — acquire it
-            cm.acquire_lock(ticket_id, role, session_id)
-
-    prompt = f"Ticket {ticket_id} has moved to '{new_state}'. Please perform your duties as {role}."
-    logger.info("Linear webhook accepted: ticket=%s state=%r -> agent=%s", ticket_id, new_state, role)
-    background_tasks.add_task(run_agent_task, role, ticket_id, prompt, session_id)
-    return {"status": "accepted", "agent": role, "ticket": ticket_id}
+    logger.info(
+        "Linear webhook queued: ticket=%s state=%r -> agent=%s task_id=%s",
+        ticket_id,
+        new_state,
+        role,
+        task_row.get("id"),
+    )
+    return {"status": "accepted", "agent": role, "ticket": ticket_id, "queued_task_id": task_row.get("id")}
 
 
 @app.get("/health")
@@ -405,10 +506,39 @@ async def Health():
     return {"status": "ok"}
 
 
+@app.get("/agent-queue")
+async def get_agent_queue(
+    role: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """List queued/running/completed tasks for queue debugging."""
+    tasks = cm.list_tasks(role=role, state=state, limit=limit)
+    counts: dict[str, int] = {}
+    for item in tasks:
+        st = str(item.get("state") or "unknown")
+        counts[st] = counts.get(st, 0) + 1
+    return {
+        "status": "ok",
+        "filters": {"role": role, "state": state, "limit": limit},
+        "count": len(tasks),
+        "counts_in_result": counts,
+        "tasks": tasks,
+    }
+
+
+@app.get("/agent-queue/{task_id}")
+async def get_agent_queue_task(task_id: int):
+    """Fetch one queue task by id."""
+    task = cm.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return {"status": "ok", "task": task}
+
+
 @app.post("/trigger-agent")
 async def trigger_agent(
     request: Request,
-    background_tasks: BackgroundTasks = None,
 ):
     """Manually trigger an SDLC agent without requiring a Linear status change.
 
@@ -442,28 +572,26 @@ async def trigger_agent(
     if not ticket_id:
         raise HTTPException(status_code=400, detail="ticket_id is required")
 
-    # Same lock-acquire pattern as the Linear webhook
-    if not cm.acquire_lock(ticket_id, role):
-        return {
-            "status": "locked",
-            "detail": (
-                f"Cannot start {role} agent for {ticket_id}: "
-                f"ticket is currently locked by an in-progress agent. "
-                f"Use DELETE /agent-lock/{ticket_id} to clear the lock first."
-            ),
-        }
-
     if not prompt or not prompt.strip():
         prompt = f"Ticket {ticket_id} — please perform your {role} duties."
 
-    logger.info("Manual trigger: role=%r ticket=%r", role, ticket_id)
+    dedup_key = f"{ticket_id}:{role}:manual"
+    created, task_row = cm.enqueue_task(
+        ticket_id,
+        role,
+        prompt,
+        dedup_key=dedup_key,
+        source_state="manual",
+    )
+    if not created:
+        return {
+            "status": "duplicate",
+            "detail": f"Task already queued/running for {role} on {ticket_id}",
+            "queued_task_id": task_row.get("id") if task_row else None,
+        }
 
-    # Background task so this endpoint returns immediately
-    if background_tasks is None:
-        raise HTTPException(status_code=500, detail="BackgroundTasks not available")
-    background_tasks.add_task(run_agent_task, role, ticket_id, prompt)
-
-    return {"status": "accepted", "agent": role, "ticket": ticket_id}
+    logger.info("Manual trigger queued: role=%r ticket=%r task_id=%s", role, ticket_id, task_row.get("id"))
+    return {"status": "accepted", "agent": role, "ticket": ticket_id, "queued_task_id": task_row.get("id")}
 
 
 @app.delete("/agent-lock/{ticket_id}")
