@@ -220,34 +220,45 @@ class ConcurrencyManager:
         dedup_key: str,
         source_state: Optional[str] = None,
     ) -> tuple[bool, dict[str, Any]]:
-        """Queue a role task if no active duplicate exists."""
+        """Queue a role task if no active duplicate exists.
+
+        A task with the same dedup_key is considered active only when its state is
+        'queued' or 'running'. 'done', 'failed', and 'cancelled' tasks are ignored
+        for deduplication — a new task may be enqueued regardless of their prior
+        completion state.
+        """
         now = time.time()
         with self._connect() as conn:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO agent_tasks (
-                        ticket_id, role, prompt, state, dedup_key, source_state,
-                        next_run_at, created_at, updated_at
-                    )
-                    VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
-                    """,
-                    (ticket_id, role, prompt, dedup_key, source_state, now, now, now),
+            # Only block on active states (queued or running).
+            # completed/failed tasks do not block new enqueues for the same dedup_key.
+            active = conn.execute(
+                """
+                SELECT id FROM agent_tasks
+                WHERE dedup_key = ? AND state IN ('queued', 'running')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (dedup_key,),
+            ).fetchone()
+            if active:
+                existing = conn.execute(
+                    "SELECT * FROM agent_tasks WHERE id = ?", (active["id"],)
+                ).fetchone()
+                return False, dict(existing) if existing else {}
+
+            conn.execute(
+                """
+                INSERT INTO agent_tasks (
+                    ticket_id, role, prompt, state, dedup_key, source_state,
+                    next_run_at, created_at, updated_at
                 )
-                row = conn.execute(
-                    "SELECT * FROM agent_tasks WHERE id = last_insert_rowid()",
-                ).fetchone()
-                return True, dict(row) if row else {}
-            except sqlite3.IntegrityError:
-                row = conn.execute(
-                    """
-                    SELECT * FROM agent_tasks
-                    WHERE dedup_key = ? AND state IN ('queued', 'running')
-                    ORDER BY id DESC LIMIT 1
-                    """,
-                    (dedup_key,),
-                ).fetchone()
-                return False, dict(row) if row else {}
+                VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                """,
+                (ticket_id, role, prompt, dedup_key, source_state, now, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM agent_tasks WHERE id = last_insert_rowid()",
+            ).fetchone()
+            return True, dict(row) if row else {}
 
     def claim_next_task(self, role: str, *, session_id: str) -> Optional[dict[str, Any]]:
         """Atomically claim the next queued task for a role."""
@@ -369,3 +380,172 @@ class ConcurrencyManager:
                 (int(task_id),),
             ).fetchone()
             return dict(row) if row else None
+
+    def recover_stale_running_tasks(
+        self,
+        *,
+        role: Optional[str] = None,
+        stale_after_seconds: float = 900.0,
+        requeue_delay_seconds: float = 0.0,
+    ) -> int:
+        """Requeue stale running tasks that no longer hold their ticket lock.
+
+        A task is considered recoverable when:
+        - state is ``running``
+        - ``started_at`` is older than ``stale_after_seconds``
+        - no matching lock exists for the same ticket+role
+        """
+        now = time.time()
+        cutoff = now - max(1.0, float(stale_after_seconds))
+        requeue_at = now + max(0.0, float(requeue_delay_seconds))
+        where = "t.state = 'running' AND t.started_at IS NOT NULL AND t.started_at <= ?"
+        params: list[Any] = [cutoff]
+        if role:
+            where += " AND t.role = ?"
+            params.append(role)
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT t.id
+                FROM agent_tasks t
+                LEFT JOIN locks l
+                  ON l.ticket_id = t.ticket_id
+                 AND l.assignee = t.role
+                WHERE {where}
+                  AND l.ticket_id IS NULL
+                """,
+                tuple(params),
+            ).fetchall()
+            if not rows:
+                return 0
+
+            recovered = 0
+            for row in rows:
+                task_id = int(row["id"])
+                updated = conn.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET state = 'queued',
+                        session_id = NULL,
+                        next_run_at = ?,
+                        updated_at = ?,
+                        last_error = COALESCE(last_error || '; ', '') || 'Auto-recovered stale running task without lock'
+                    WHERE id = ? AND state = 'running'
+                    """,
+                    (requeue_at, now, task_id),
+                )
+                if updated.rowcount == 1:
+                    recovered += 1
+            return recovered
+
+    def get_queue_stats(self, *, stale_after_seconds: float = 900.0) -> dict[str, Any]:
+        """Return aggregate queue stats and stale-running candidate counts."""
+        cutoff = time.time() - max(1.0, float(stale_after_seconds))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT state, COUNT(*) AS n
+                FROM agent_tasks
+                GROUP BY state
+                """
+            ).fetchall()
+            counts_by_state: dict[str, int] = {
+                str(r["state"]): int(r["n"]) for r in rows
+            }
+            total = sum(counts_by_state.values())
+
+            stale_total = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM agent_tasks t
+                LEFT JOIN locks l
+                  ON l.ticket_id = t.ticket_id
+                 AND l.assignee = t.role
+                WHERE t.state = 'running'
+                  AND t.started_at IS NOT NULL
+                  AND t.started_at <= ?
+                  AND l.ticket_id IS NULL
+                """,
+                (cutoff,),
+            ).fetchone()
+            stale_candidates = int((stale_total or {"n": 0})["n"])
+
+            stale_rows = conn.execute(
+                """
+                SELECT t.role, COUNT(*) AS n
+                FROM agent_tasks t
+                LEFT JOIN locks l
+                  ON l.ticket_id = t.ticket_id
+                 AND l.assignee = t.role
+                WHERE t.state = 'running'
+                  AND t.started_at IS NOT NULL
+                  AND t.started_at <= ?
+                  AND l.ticket_id IS NULL
+                GROUP BY t.role
+                ORDER BY n DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+            stale_by_role = {str(r["role"]): int(r["n"]) for r in stale_rows}
+
+        return {
+            "total": total,
+            "counts_by_state": counts_by_state,
+            "stale_after_seconds": int(stale_after_seconds),
+            "stale_running_candidates": stale_candidates,
+            "stale_running_by_role": stale_by_role,
+        }
+
+    def revive_stale_developer_task(
+        self,
+        ticket_id: str,
+        dedup_key: str,
+        stale_after_seconds: float = 900.0,
+    ) -> bool:
+        """Revive a stale Developer task so it can be re-claimed.
+
+        When a Developer agent exits without updating Linear (e.g. burned iterations
+        waiting for CI), a second Linear webhook fires for the same state. The dedup
+        index blocks a new task, but the existing task is stale (no lock held).
+        This method resets that stale task so the worker can pick it up again.
+
+        Returns True if a stale task was revived, False if the existing task is
+        not stale or is not a Developer task.
+        """
+        cutoff = time.time() - max(1.0, float(stale_after_seconds))
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT t.id, t.state, t.started_at, t.attempts, l.ticket_id AS lock_held
+                FROM agent_tasks t
+                LEFT JOIN locks l
+                  ON l.ticket_id = t.ticket_id
+                 AND l.assignee = t.role
+                WHERE t.dedup_key = ?
+                  AND t.role = 'Developer'
+                  AND t.state = 'running'
+                  AND t.started_at IS NOT NULL
+                  AND t.started_at <= ?
+                ORDER BY t.id DESC
+                LIMIT 1
+                """,
+                (dedup_key, cutoff),
+            ).fetchone()
+            if not row:
+                return False
+
+            conn.execute(
+                """
+                UPDATE agent_tasks
+                SET state = 'queued',
+                    session_id = NULL,
+                    next_run_at = ?,
+                    updated_at = ?,
+                    last_error = COALESCE(last_error || '; ', '') || 'Revived: prior Developer agent exited without updating Linear (stale task)'
+                WHERE id = ?
+                  AND state = 'running'
+                """,
+                (time.time(), time.time(), int(row["id"])),
+            )
+            return True

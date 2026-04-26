@@ -60,12 +60,23 @@ app = FastAPI(title="Hermes Webhook Server")
 cm = ConcurrencyManager()
 _worker_tasks: dict[str, asyncio.Task] = {}
 _worker_stop_event = asyncio.Event()
+_STALE_RUNNING_SECONDS = float(os.getenv("HERMES_QUEUE_STALE_RUNNING_SECONDS", "900"))
 
 LINEAR_WEBHOOK_SECRET=os.getenv("LINEAR_WEBHOOK_SECRET") or os.getenv("LINEAR_HMAC_SECRET")
 LINEAR_BOT_USER_ID = os.getenv("LINEAR_BOT_USER_ID")
-LINEAR_API_KEY = os.getenv("LINEAR_API_KEY", "")
+LINEAR_API_KEY=os.getenv("LINEAR_API_KEY", "")
 LINEAR_API_URL = "https://api.linear.app/graphql"
 NEEDS_HUMAN_LABEL_ID = "331b7988-b4b2-4116-853a-ced489f5eb5f"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN", ""))
+GITHUB_API_URL = "https://api.github.com"
+CI_POLL_INTERVAL_SECONDS = float(os.getenv("CI_POLL_INTERVAL_SECONDS", "60"))
+CI_POLL_TIMEOUT_SECONDS = float(os.getenv("CI_POLL_TIMEOUT_SECONDS", "7200"))
+
+# Tickets currently waiting for CI to complete. Key = ticket_id.
+# Value = {"pr_number": int, "repo": str, "owner": str, "added_at": float, "branch": str,
+#          "in_progress_state_id": str}
+_ci_polling_tickets: Dict[str, dict] = {}
+_ci_poll_lock = asyncio.Lock()
 
 
 def _linear_gql(query: str, variables: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -98,6 +109,7 @@ _STATE_AGENT_MAPPING_RAW: Dict[str, str] = {
     "Unstarted": "Product Manager",
     "Triage": "Product Manager",
     "In Progress": "Developer",
+    "CI in Progress": "CI-Poll",  # Server-side polling only; no agent dispatched
     "In Review": "Reviewer",
     "Ready For QA": "QA",
 }
@@ -330,6 +342,18 @@ async def _agent_worker(role: str) -> None:
     """Continuously process queued tasks for a single role."""
     logger.info("Starting queue worker for role=%s", role)
     while not _worker_stop_event.is_set():
+        recovered = cm.recover_stale_running_tasks(
+            role=role,
+            stale_after_seconds=_STALE_RUNNING_SECONDS,
+            requeue_delay_seconds=0.0,
+        )
+        if recovered:
+            logger.warning(
+                "Recovered %d stale running task(s) for role=%s (missing lock).",
+                recovered,
+                role,
+            )
+
         worker_session_id = f"{role}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         task = cm.claim_next_task(role, session_id=worker_session_id)
         if not task:
@@ -358,6 +382,214 @@ async def _agent_worker(role: str) -> None:
     logger.info("Stopped queue worker for role=%s", role)
 
 
+def _github_headers() -> Dict[str, str]:
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
+
+def _resolve_repo_owner_repo(pr_info: Dict[str, Any] = None, data: Dict[str, Any] = None) -> tuple:
+    """Resolve (owner, repo) from PR data or GitHub API."""
+    if pr_info:
+        repo_url = pr_info.get("head", {}).get("repo", {}).get("full_name", "")
+        if repo_url and "/" in repo_url:
+            return tuple(repo_url.split("/", 1))
+
+    # Fallback: query GitHub for the repo associated with the Linear team's GitHub label
+    # or just use the env-known repo (faworkshop/true-review)
+    return (os.getenv("GITHUB_REPO_OWNER", "faw-workshop"),
+            os.getenv("GITHUB_REPO_NAME", "true-review"))
+
+
+def _find_pr_by_branch(branch: str) -> Dict[str, Any]:
+    """Find an open PR for a given branch name."""
+    owner, repo = _resolve_repo_owner_repo()
+    data = _github_get(f"/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}")
+    if isinstance(data, list) and len(data) > 0:
+        return data[0]
+    return {}
+
+
+def _find_branch_for_ticket(ticket_id: str) -> str:
+    """Try to find the branch name for a ticket by matching ticket ID in branch names."""
+    owner, repo = _resolve_repo_owner_repo()
+    data = _github_get(f"/repos/{owner}/{repo}/branches")
+    if not isinstance(data, list):
+        return ""
+    # Branch naming convention: feature/FAW-34-something or fix/FAW-34-something
+    import re
+    pattern = re.compile(rf"(?:feature|fix|bugfix)/)?{re.escape(ticket_id)}(?:-|$)", re.IGNORECASE)
+    for branch in data:
+        name = branch.get("name", "")
+        if pattern.search(name):
+            return name
+    return ""
+
+
+def _github_get(fpath: str) -> Dict[str, Any]:
+    """GET against the GitHub API. Returns {} on error."""
+    if not GITHUB_TOKEN:
+        return {}
+    try:
+        resp = requests.get(
+            GITHUB_API_URL + fpath,
+            headers=_github_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning("GitHub API GET %s failed: %s", fpath, e)
+        return {}
+
+
+def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
+    """Poll GitHub for CI status on a PR. Returns dict with 'runs' and 'all_passed'."""
+    data = _github_get(f"/repos/{owner}/{repo}/pulls/{pr_number}")
+    if not data:
+        return {"runs": [], "all_passed": False, "error": "no response"}
+
+    head_sha = data.get("head", {}).get("sha", "")
+    branch = data.get("head", {}).get("ref", "")
+
+    # Get check runs for the head SHA
+    check_data = _github_get(f"/repos/{owner}/{repo}/commits/{head_sha}/check-runs")
+    if not check_data:
+        return {"runs": [], "all_passed": False, "error": "no check runs", "branch": branch}
+
+    runs = check_data.get("check_runs", []) or []
+    conclusions = [r.get("conclusion") for r in runs]
+    all_passed = (
+        len(runs) > 0
+        and all(c in ("success", "skipped", "neutral") for c in conclusions)
+    )
+
+    return {"runs": runs, "all_passed": all_passed, "branch": branch}
+
+
+async def _ci_poll_worker() -> None:
+    """Background worker: every CI_POLL_INTERVAL_SECONDS, check each pending ticket's CI status.
+    When all checks pass, move the ticket to 'In Progress'.
+    When timeout is exceeded, remove the ticket from the polling set."""
+    while not _worker_stop_event.is_set():
+        await asyncio.sleep(CI_POLL_INTERVAL_SECONDS)
+
+        async with _ci_poll_lock:
+            if not _ci_polling_tickets:
+                continue
+
+            expired = []
+            for ticket_id, info in _ci_polling_tickets.items():
+                owner = info["owner"]
+                repo = info["repo"]
+                pr_number = info["pr_number"]
+                added_at = info["added_at"]
+
+                elapsed = time.time() - added_at
+                if elapsed > CI_POLL_TIMEOUT_SECONDS:
+                    expired.append(ticket_id)
+                    logger.warning(
+                        "CI polling timed out for %s after %ds — removing from poll set",
+                        ticket_id,
+                        elapsed,
+                    )
+                    continue
+
+                ci = _get_ci_status_for_pr(owner, repo, pr_number)
+                logger.info(
+                    "CI poll %s: %d runs, all_passed=%s (elapsed=%.0fs)",
+                    ticket_id,
+                    len(ci.get("runs", [])),
+                    ci.get("all_passed"),
+                    elapsed,
+                )
+
+                if ci.get("all_passed"):
+                    state_id = info.get("in_progress_state_id")
+                    if state_id:
+                        _move_linear_ticket_state(ticket_id, state_id)
+                    logger.info("CI PASSED for %s — moved to In Progress", ticket_id)
+                    _post_linear_comment(
+                        ticket_id,
+                        f"✅ CI checks passed on branch `{ci.get('branch', 'unknown')}` — "
+                        f"ticket moved to In Progress.",
+                    )
+                    expired.append(ticket_id)
+
+            for tid in expired:
+                _ci_polling_tickets.pop(tid, None)
+
+
+def _post_linear_comment(ticket_id: str, body: str) -> None:
+    """Post a comment to a Linear issue."""
+    mutation = """
+    mutation CommentCreate($input: CommentCreateInput!) {
+      commentCreate(input: $input) { success comment { id } }
+    }
+    """
+    _linear_gql(mutation, {"input": {"issueId": ticket_id, "body": body}})
+
+
+def _move_linear_ticket_state(ticket_id: str, state_id: str) -> None:
+    """Move a Linear issue to a specific state by state ID."""
+    mutation = """
+    mutation UpdateState($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: {stateId: $stateId}) { success }
+    }
+    """
+    result = _linear_gql(mutation, {"id": ticket_id, "stateId": state_id})
+    if result:
+        logger.info("Moved ticket %s to state %s", ticket_id, state_id)
+    else:
+        logger.error("Failed to move ticket %s to state %s", ticket_id, state_id)
+
+
+def _get_in_progress_state_id(ticket_id: str) -> str | None:
+    """Get the Linear state ID for 'In Progress' for a ticket's team.
+    Returns None if not found."""
+    query = """
+    query Issue($id: String!) {
+      issue(id: $id) {
+        team {
+          states {
+            nodes { id name }
+          }
+        }
+      }
+    }
+    """
+    data = _linear_gql(query, {"id": ticket_id})
+    if not data:
+        return None
+    nodes = (data.get("issue") or {}).get("team", {}).get("states", {}).get("nodes") or []
+    for state in nodes:
+        if _normalize_linear_state_name(state.get("name") or "") == "in progress":
+            return state["id"]
+    return None
+
+
+def start_ci_poll(ticket_id: str, pr_number: int, owner: str, repo: str, branch: str,
+                  in_progress_state_id: str = None) -> None:
+    """Register a ticket for CI polling. Idempotent — replaces existing entry."""
+    if in_progress_state_id is None:
+        in_progress_state_id = _get_in_progress_state_id(ticket_id)
+    _ci_polling_tickets[ticket_id] = {
+        "pr_number": pr_number,
+        "owner": owner,
+        "repo": repo,
+        "branch": branch,
+        "added_at": time.time(),
+        "in_progress_state_id": in_progress_state_id,
+    }
+    logger.info("Started CI polling for %s (PR #%d, branch=%s, in_progress_state_id=%s)",
+                ticket_id, pr_number, branch, in_progress_state_id)
+
+
+def stop_ci_poll(ticket_id: str) -> None:
+    _ci_polling_tickets.pop(ticket_id, None)
+
+
 @app.on_event("startup")
 async def _startup_workers() -> None:
     _worker_stop_event.clear()
@@ -365,6 +597,7 @@ async def _startup_workers() -> None:
         if role in _worker_tasks and not _worker_tasks[role].done():
             continue
         _worker_tasks[role] = asyncio.create_task(_agent_worker(role))
+    asyncio.create_task(_ci_poll_worker())
 
 
 @app.on_event("shutdown")
@@ -450,6 +683,40 @@ async def linear_webhook(request: Request):
             normalized=state_key,
         )
 
+    # ── CI-Poll: ticket moved to "CI in Progress" ───────────────────────────
+    # Server-side polling. No agent dispatched. Look up the PR by branch name
+    # and start the background CI polling loop.
+    if role == "CI-Poll":
+        # Extract branch/PR from Linear's pullRequest data if available
+        pull_req = data.get("pullRequest") or {}
+        branch = pull_req.get("headRefName", "")
+        pr_number = pull_req.get("number", None)
+        pr_info = {"head": {"ref": branch, "repo": pull_req.get("repository", {})}} if pull_req else {}
+
+        if not branch:
+            # Fallback: search GitHub for a PR whose head branch matches the ticket
+            branch = _find_branch_for_ticket(ticket_id)
+            if branch:
+                pr_info = _find_pr_by_branch(branch)
+                if pr_info:
+                    pr_number = pr_info.get("number")
+
+        if branch and pr_number:
+            # Resolve repo owner/name from the PR data or repo label
+            owner, repo = _resolve_repo_owner_repo(pr_info=pr_info if pr_info else None, data=data)
+            in_progress_state_id = _get_in_progress_state_id(ticket_id)
+            start_ci_poll(ticket_id, pr_number, owner, repo, branch,
+                          in_progress_state_id=in_progress_state_id)
+            return {
+                "status": "ci_polling_started",
+                "ticket": ticket_id,
+                "pr": pr_number,
+                "branch": branch,
+            }
+        else:
+            logger.warning("CI-Poll: could not resolve branch/PR for %s", ticket_id)
+            return _log_ignored("CI-Poll: no branch/PR found for ticket", ticket=ticket_id)
+
     linear_issue_uuid = _linear_issue_uuid_for_api(data, ticket_id)
     if role in {"Product Manager", "Developer", "Reviewer", "QA"}:
         if not linear_issue_uuid:
@@ -483,6 +750,21 @@ async def linear_webhook(request: Request):
         source_state=state_key,
     )
     if not created:
+        # Dedup blocked — but check if the existing task is a stale Developer run
+        # (agent exited without updating Linear). Revive it so it can finish
+        # properly instead of being permanently stuck.
+        revived = cm.revive_stale_developer_task(ticket_id, dedup_key, stale_after_seconds=_STALE_RUNNING_SECONDS)
+        if revived:
+            logger.info(
+                "Revived stale Developer task for %s (prior agent exited without updating Linear).",
+                ticket_id,
+            )
+            return {
+                "status": "revived",
+                "agent": role,
+                "ticket": ticket_id,
+                "note": "stale Developer task revived",
+            }
         return _log_ignored(
             "Duplicate task already queued/running",
             ticket=ticket_id,
@@ -527,6 +809,15 @@ async def get_agent_queue(
     }
 
 
+@app.get("/agent-queue/stats")
+async def get_agent_queue_stats(
+    stale_after_seconds: int = Query(default=900, ge=30, le=86400),
+):
+    """Get aggregate queue stats and stale-running candidates."""
+    stats = cm.get_queue_stats(stale_after_seconds=float(stale_after_seconds))
+    return {"status": "ok", **stats}
+
+
 @app.get("/agent-queue/{task_id}")
 async def get_agent_queue_task(task_id: int):
     """Fetch one queue task by id."""
@@ -534,6 +825,31 @@ async def get_agent_queue_task(task_id: int):
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return {"status": "ok", "task": task}
+
+
+@app.post("/agent-queue/recover-stale")
+async def recover_stale_queue_tasks(
+    role: str | None = Query(default=None),
+    stale_after_seconds: int = Query(default=900, ge=30, le=86400),
+):
+    """Manually requeue stale running tasks that no longer have a matching lock."""
+    recovered = cm.recover_stale_running_tasks(
+        role=role,
+        stale_after_seconds=float(stale_after_seconds),
+        requeue_delay_seconds=0.0,
+    )
+    logger.warning(
+        "Manual stale queue recovery invoked: role=%s stale_after=%ss recovered=%d",
+        role,
+        stale_after_seconds,
+        recovered,
+    )
+    return {
+        "status": "ok",
+        "role": role,
+        "stale_after_seconds": stale_after_seconds,
+        "recovered": recovered,
+    }
 
 
 @app.post("/trigger-agent")
