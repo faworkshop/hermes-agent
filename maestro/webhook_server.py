@@ -398,13 +398,15 @@ def _resolve_repo_owner_repo(pr_info: Dict[str, Any] = None, data: Dict[str, Any
 
     # Fallback: query GitHub for the repo associated with the Linear team's GitHub label
     # or just use the env-known repo (faworkshop/true-review)
-    return (os.getenv("GITHUB_REPO_OWNER", "faw-workshop"),
+    return (os.getenv("GITHUB_REPO_OWNER", "faworkshop"),
             os.getenv("GITHUB_REPO_NAME", "true-review"))
 
 
 def _find_pr_by_branch(branch: str) -> Dict[str, Any]:
-    """Find an open PR for a given branch name."""
+    """Find an open PR whose head branch matches the given branch name.
+    Returns {} if not found."""
     owner, repo = _resolve_repo_owner_repo()
+    # Search all open PRs — the head branch matches ours
     data = _github_get(f"/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}")
     if isinstance(data, list) and len(data) > 0:
         return data[0]
@@ -412,18 +414,38 @@ def _find_pr_by_branch(branch: str) -> Dict[str, Any]:
 
 
 def _find_branch_for_ticket(ticket_id: str) -> str:
-    """Try to find the branch name for a ticket by matching ticket ID in branch names."""
-    owner, repo = _resolve_repo_owner_repo()
-    data = _github_get(f"/repos/{owner}/{repo}/branches")
-    if not isinstance(data, list):
-        return ""
-    # Branch naming convention: feature/FAW-34-something or fix/FAW-34-something
+    """Try to find the branch name for a ticket.
+
+    Strategy:
+    1. Search repo branches for one whose name contains the ticket ID
+       (e.g. feature/FAW-34-final matches FAW-34).
+    2. If no branch found, search open PR head branches for the ticket ID.
+       The PR title/branch often contains the ticket ID even when the local
+       branch has been rebased away from the default branch list.
+
+    Returns the branch name or '' if not found.
+    """
     import re
-    pattern = re.compile(rf"(?:feature|fix|bugfix)/)?{re.escape(ticket_id)}(?:-|$)", re.IGNORECASE)
-    for branch in data:
-        name = branch.get("name", "")
-        if pattern.search(name):
-            return name
+    owner, repo = _resolve_repo_owner_repo()
+
+    # 1. Search branches
+    data = _github_get(f"/repos/{owner}/{repo}/branches")
+    if isinstance(data, list):
+        escaped_id = re.escape(ticket_id)
+        pattern = re.compile(rf"(?:^|[/])({escaped_id})(?:-|$)", re.IGNORECASE)
+        for branch in data:
+            name = branch.get("name", "")
+            if pattern.search(name):
+                return name
+
+    # 2. Fallback: search open PR head branches for the ticket ID
+    prs = _github_get(f"/repos/{owner}/{repo}/pulls?state=open")
+    if isinstance(prs, list):
+        for pr in prs:
+            head_ref = pr.get("head", {}).get("ref", "")
+            if ticket_id.lower() in head_ref.lower():
+                return head_ref
+
     return ""
 
 
