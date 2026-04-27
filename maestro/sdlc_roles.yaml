@@ -85,6 +85,21 @@ pipeline:
         - Install deps: `pnpm install` (NOT `npm install`)
         - Add a package: `pnpm add <package>` (NOT `npm install`)
         - Working directory for this project is: `maestro/true-review/`
+      CI/Jest OOM RULE (mandatory):
+        - If test runs or CI logs show any Node/Jest memory signal, treat it as a required fix, not a flaky rerun:
+          `JavaScript heap out of memory`, `FATAL ERROR: Ineffective mark-compacts near heap limit`,
+          `Reached heap limit`, or `ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL ... SIGABRT`.
+        - First, isolate the heavy target:
+          1) `cd apps/frontend && pnpm exec jest --listTests`
+          2) Run narrower suites/files (or `--testNamePattern`) to find the failing hotspot.
+        - Then apply durable fixes in code/tests (preferred) before relying on heap increases:
+          - remove retry/queue infinite loops in hooks/services,
+          - ensure async tests await completion deterministically (avoid leaked microtasks/promises),
+          - reset/reinstall mock implementations in `beforeEach` when tests mutate shared mocks.
+        - If needed for diagnosis only, rerun with larger heap:
+          `NODE_OPTIONS=--max-old-space-size=8192 pnpm exec jest ...`
+          but do NOT stop at this workaround unless root cause cannot be fixed in-session.
+        - Before opening or updating PR, re-run the exact CI-like command to confirm the OOM is gone.
       1. Branch from `develop` (not `main`). Create `feature/{{ticket_id}}` or `bugfix/{{ticket_id}}` from the latest `develop`.
       2. Write clean, idiomatic code. If writing Python, follow PEP 8 standards.
       3. You MUST write or update unit tests for your changes. A PR without tests is incomplete.
@@ -108,6 +123,8 @@ pipeline:
             CRITICAL: linear_update_status MUST be your LAST action. Do NOT post any comments, add any labels, or take any action after calling it.
     prompt: |
       Ticket {{ticket_id}} is 'In Progress'. Branch from `develop`, write the code and tests, verify they pass. Create a DRAFT PR with base `develop`, link it to Linear. Wait for GitHub CI checks (test-frontend and test-backend) to pass. When both checks are SUCCESS and the code is ready, convert the draft PR to OPEN, then move the ticket to 'In Review'. Stop after the status update — do nothing after it.
+      If Jest/CI memory errors appear, follow the CI/Jest OOM RULE in the system instructions:
+      isolate the hotspot with narrow targets, fix root cause in code/tests, then rerun CI-equivalent command to verify.
 
       IMPORTANT — mandatory exit rule:
       Regardless of whether CI is still running or has finished, you MUST call
