@@ -211,6 +211,40 @@ class ConcurrencyManager:
             cursor.execute("SELECT ticket_id, assignee, locked_at FROM locks")
             return [(tid, assignee, lat, now - lat) for tid, assignee, lat in cursor.fetchall()]
 
+    def get_queued_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return the N most recent queued tasks (not yet claimed)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT ticket_id, role, state, attempts, next_run_at,
+                       created_at, last_error
+                FROM agent_tasks
+                WHERE state = 'queued'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_recent_finished_tasks(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return the N most recently finished tasks (done/failed/cancelled)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT ticket_id, role, state, finished_at, last_error,
+                       started_at, finished_at
+                FROM agent_tasks
+                WHERE state IN ('done', 'failed', 'cancelled')
+                ORDER BY finished_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def enqueue_task(
         self,
         ticket_id: str,

@@ -4121,36 +4121,125 @@ class GatewayRunner:
         from agent.concurrency import ConcurrencyManager
         import time
 
-        cm = ConcurrencyManager()
-        rows = cm.get_all_locks()
-
-        if not rows:
-            return "📊 **Agent Dashboard**\n\nNo active agent locks. All tickets are free."
-
-        lines = ["📊 **Agent Dashboard**\n"]
+        # Gateway runs from ~/.hermes/hermes-agent/ but the pipeline state lives in
+        # the webhook server's DB at faworkshop/hermes-agent/agent_state.db
+        cm = ConcurrencyManager(db_path="/Users/maestro/faworkshop/hermes-agent/agent_state.db")
         now = time.time()
 
-        # Group by assignee (role)
-        by_role: dict[str, list[tuple]] = {}
-        for ticket_id, assignee, locked_at in rows:
-            by_role.setdefault(assignee, []).append((ticket_id, locked_at))
+        # --- Running tasks (active in-flight agents) ---
+        import sqlite3
+        with sqlite3.connect(cm.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            running_rows = conn.execute(
+                """
+                SELECT ticket_id, role, started_at, attempts, session_id
+                FROM agent_tasks WHERE state = 'running'
+                ORDER BY started_at ASC
+                """,
+            ).fetchall()
+        running = [dict(r) for r in running_rows]
 
-        for role, tickets in sorted(by_role.items()):
-            lines.append(f"**{role}** ({len(tickets)} active)")
-            for ticket_id, locked_at in tickets:
-                age_secs = now - locked_at
-                age_mins = age_secs / 60
-                age_str = f"{age_mins:.1f}m ago" if age_mins < 60 else f"{age_mins/60:.1f}h ago"
-                if age_secs > 1800:
-                    lines.append(f"  🔴 STALE `{ticket_id}` — locked {age_str} ⚠️ (auto-expires at 30m)")
-                elif age_secs > 1200:
-                    lines.append(f"  🟡 Aging `{ticket_id}` — locked {age_str}")
+        # --- Active locks ---
+        locks = cm.get_all_locks_with_age()
+
+        # --- Queued tasks (pending claim) ---
+        queued = cm.get_queued_tasks(limit=10)
+
+        # --- Recently finished ---
+        recent = cm.get_recent_finished_tasks(limit=8)
+
+        # --- Collect stale ticket IDs for resolution hints ---
+        stale_tickets = {tid for tid, _, _, age in locks if age > 1800}
+        queued_ticket_ids = {q["ticket_id"] for q in queued}
+
+        # ── Section 1: Running ─────────────────────────────────────────────────────
+        lines = ["📊 **Pipeline Dashboard**\n"]
+
+        if running:
+            lines.append(f"**Running** ({len(running)} active)")
+            for r in running:
+                tid = r["ticket_id"]
+                role = r["role"]
+                age = now - r["started_at"]
+                if age > 1200:
+                    lines.append(f"  🟡 `{tid}` [{role}] — {self._fmt_age(age)}")
                 else:
-                    lines.append(f"  🔒 `{ticket_id}` — locked {age_str}")
+                    lines.append(f"  ⚡ `{tid}` [{role}] — {self._fmt_age(age)}")
             lines.append("")
 
-        lines.append("Locks auto-expire after 30 minutes of inactivity.")
+        # ── Section 2: Queued (pending claim) ──────────────────────────────────
+        if queued:
+            lines.append("**In Queue** (waiting for worker to claim)")
+            for q in queued:
+                tid = q["ticket_id"]
+                role = q["role"]
+                wait = now - q["created_at"]
+                wait_str = f"{wait/60:.1f}m ago" if wait < 3600 else f"{wait/3600:.1f}h ago"
+                retry = f"  retry={q['attempts']}" if q["attempts"] else ""
+                err = f"  ⚠️ {q['last_error'][:50]}" if q["last_error"] else ""
+                lines.append(f"  • `{tid}` [{role}]{retry} — queued {wait_str}{err}")
+            lines.append("")
+        else:
+            lines.append("**In Queue** — empty\n")
+
+        # ── Section 3: Active locks ────────────────────────────────────────────
+        if locks:
+            by_role: dict[str, list[tuple]] = {}
+            for tid, assignee, lat, age in locks:
+                by_role.setdefault(assignee, []).append((tid, lat, age))
+
+            for role, tickets in sorted(by_role.items()):
+                lines.append(f"**{role}** — {len(tickets)} active")
+                for tid, lat, age in tickets:
+                    if age > 1800:
+                        lines.append(
+                            f"  🔴 `{tid}` — {self._fmt_age(age)} ⚠️ STALE "
+                            f"(auto-expires 30m, needs /dashboard resolve)"
+                        )
+                    elif age > 1200:
+                        lines.append(f"  🟡 `{tid}` — {self._fmt_age(age)}")
+                    else:
+                        lines.append(f"  🔒 `{tid}` — {self._fmt_age(age)}")
+                lines.append("")
+        else:
+            lines.append("**Active Locks** — none\n")
+
+        # ── Section 4: Recently finished ───────────────────────────────────────
+        if recent:
+            lines.append("**Recently Done**")
+            for r in recent:
+                tid = r["ticket_id"]
+                role = r["role"]
+                state = r["state"]
+                ts = r["finished_at"]
+                elapsed = (r["finished_at"] - r["started_at"]) if r["started_at"] and r["finished_at"] else 0
+                when = self._fmt_age(now - ts) if ts else "?"
+                icon = "✅" if state == "done" else "❌" if state == "failed" else "⚪"
+                elapsed_str = f" ({elapsed/60:.1f}m)" if elapsed else ""
+                err_str = f" — {r['last_error'][:40]}" if r["last_error"] else ""
+                lines.append(f"  {icon} `{tid}` [{role}] {when}{elapsed_str}{err_str}")
+            lines.append("")
+
+        # ── Section 5: Stale resolution hint ──────────────────────────────────
+        if stale_tickets:
+            lines.append(
+                f"⚠️ **{len(stale_tickets)} stale lock(s) detected.** "
+                "Use `/trigger {role} {ticket}` to restart a crashed agent, "
+                "or manually move the Linear ticket to unblock."
+            )
+        else:
+            lines.append("All locks fresh. Pipeline healthy.")
+
         return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_age(secs: float) -> str:
+        if secs < 120:
+            return f"{secs:.0f}s ago"
+        elif secs < 3600:
+            return f"{secs/60:.1f}m ago"
+        else:
+            return f"{secs/3600:.1f}h ago"
 
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
