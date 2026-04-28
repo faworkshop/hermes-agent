@@ -59,6 +59,7 @@ if not logger.handlers:
 app = FastAPI(title="Hermes Webhook Server")
 cm = ConcurrencyManager()
 _worker_tasks: dict[str, asyncio.Task] = {}
+_ci_poll_task: asyncio.Task | None = None
 _worker_stop_event = asyncio.Event()
 _STALE_RUNNING_SECONDS = float(os.getenv("HERMES_QUEUE_STALE_RUNNING_SECONDS", "900"))
 
@@ -342,43 +343,54 @@ async def _agent_worker(role: str) -> None:
     """Continuously process queued tasks for a single role."""
     logger.info("Starting queue worker for role=%s", role)
     while not _worker_stop_event.is_set():
-        recovered = cm.recover_stale_running_tasks(
-            role=role,
-            stale_after_seconds=_STALE_RUNNING_SECONDS,
-            requeue_delay_seconds=0.0,
-        )
-        if recovered:
-            logger.warning(
-                "Recovered %d stale running task(s) for role=%s (missing lock).",
-                recovered,
-                role,
-            )
-
-        worker_session_id = f"{role}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        task = cm.claim_next_task(role, session_id=worker_session_id)
-        if not task:
-            await asyncio.sleep(0.8)
-            continue
-
-        task_id = int(task["id"])
-        ticket_id = str(task["ticket_id"])
-        prompt = str(task["prompt"])
-        session_id = str(task.get("session_id") or worker_session_id)
-
-        if not cm.acquire_lock(ticket_id, role, session_id=session_id):
-            cm.requeue_task(
-                task_id,
-                delay_seconds=20.0,
-                error=f"Ticket lock busy for role={role}, ticket={ticket_id}",
-            )
-            continue
-
         try:
-            ok = await run_agent_task(role, ticket_id, prompt, session_id=session_id)
-            cm.complete_task(task_id, success=ok, error=None if ok else "Agent run failed")
+            recovered = cm.recover_stale_running_tasks(
+                role=role,
+                stale_after_seconds=_STALE_RUNNING_SECONDS,
+                requeue_delay_seconds=0.0,
+            )
+            if recovered:
+                logger.warning(
+                    "Recovered %d stale running task(s) for role=%s (missing lock).",
+                    recovered,
+                    role,
+                )
+
+            worker_session_id = f"{role}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            task = cm.claim_next_task(role, session_id=worker_session_id)
+            if not task:
+                await asyncio.sleep(0.8)
+                continue
+
+            task_id = int(task["id"])
+            ticket_id = str(task["ticket_id"])
+            prompt = str(task["prompt"])
+            session_id = str(task.get("session_id") or worker_session_id)
+
+            if not cm.acquire_lock(ticket_id, role, session_id=session_id):
+                cm.requeue_task(
+                    task_id,
+                    delay_seconds=20.0,
+                    error=f"Ticket lock busy for role={role}, ticket={ticket_id}",
+                )
+                continue
+
+            try:
+                ok = await run_agent_task(role, ticket_id, prompt, session_id=session_id)
+                cm.complete_task(task_id, success=ok, error=None if ok else "Agent run failed")
+            except Exception as exc:
+                logger.error("Worker %s failed task %s: %s", role, task_id, exc, exc_info=True)
+                cm.complete_task(task_id, success=False, error=str(exc))
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.error("Worker %s failed task %s: %s", role, task_id, exc, exc_info=True)
-            cm.complete_task(task_id, success=False, error=str(exc))
+            logger.error(
+                "Queue worker loop error for role=%s: %s. Backing off and continuing.",
+                role,
+                exc,
+                exc_info=True,
+            )
+            await asyncio.sleep(1.5)
     logger.info("Stopped queue worker for role=%s", role)
 
 
@@ -495,52 +507,58 @@ async def _ci_poll_worker() -> None:
     When all checks pass, move the ticket to 'In Progress'.
     When timeout is exceeded, remove the ticket from the polling set."""
     while not _worker_stop_event.is_set():
-        await asyncio.sleep(CI_POLL_INTERVAL_SECONDS)
+        try:
+            await asyncio.sleep(CI_POLL_INTERVAL_SECONDS)
 
-        async with _ci_poll_lock:
-            if not _ci_polling_tickets:
-                continue
-
-            expired = []
-            for ticket_id, info in _ci_polling_tickets.items():
-                owner = info["owner"]
-                repo = info["repo"]
-                pr_number = info["pr_number"]
-                added_at = info["added_at"]
-
-                elapsed = time.time() - added_at
-                if elapsed > CI_POLL_TIMEOUT_SECONDS:
-                    expired.append(ticket_id)
-                    logger.warning(
-                        "CI polling timed out for %s after %ds — removing from poll set",
-                        ticket_id,
-                        elapsed,
-                    )
+            async with _ci_poll_lock:
+                if not _ci_polling_tickets:
                     continue
 
-                ci = _get_ci_status_for_pr(owner, repo, pr_number)
-                logger.info(
-                    "CI poll %s: %d runs, all_passed=%s (elapsed=%.0fs)",
-                    ticket_id,
-                    len(ci.get("runs", [])),
-                    ci.get("all_passed"),
-                    elapsed,
-                )
+                expired = []
+                for ticket_id, info in _ci_polling_tickets.items():
+                    owner = info["owner"]
+                    repo = info["repo"]
+                    pr_number = info["pr_number"]
+                    added_at = info["added_at"]
 
-                if ci.get("all_passed"):
-                    state_id = info.get("in_progress_state_id")
-                    if state_id:
-                        _move_linear_ticket_state(ticket_id, state_id)
-                    logger.info("CI PASSED for %s — moved to In Progress", ticket_id)
-                    _post_linear_comment(
+                    elapsed = time.time() - added_at
+                    if elapsed > CI_POLL_TIMEOUT_SECONDS:
+                        expired.append(ticket_id)
+                        logger.warning(
+                            "CI polling timed out for %s after %ds — removing from poll set",
+                            ticket_id,
+                            elapsed,
+                        )
+                        continue
+
+                    ci = _get_ci_status_for_pr(owner, repo, pr_number)
+                    logger.info(
+                        "CI poll %s: %d runs, all_passed=%s (elapsed=%.0fs)",
                         ticket_id,
-                        f"✅ CI checks passed on branch `{ci.get('branch', 'unknown')}` — "
-                        f"ticket moved to In Progress.",
+                        len(ci.get("runs", [])),
+                        ci.get("all_passed"),
+                        elapsed,
                     )
-                    expired.append(ticket_id)
 
-            for tid in expired:
-                _ci_polling_tickets.pop(tid, None)
+                    if ci.get("all_passed"):
+                        state_id = info.get("in_progress_state_id")
+                        if state_id:
+                            _move_linear_ticket_state(ticket_id, state_id)
+                        logger.info("CI PASSED for %s — moved to In Progress", ticket_id)
+                        _post_linear_comment(
+                            ticket_id,
+                            f"✅ CI checks passed on branch `{ci.get('branch', 'unknown')}` — "
+                            f"ticket moved to In Progress.",
+                        )
+                        expired.append(ticket_id)
+
+                for tid in expired:
+                    _ci_polling_tickets.pop(tid, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("CI poll worker loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(2.0)
 
 
 def _post_linear_comment(ticket_id: str, body: str) -> None:
@@ -614,23 +632,29 @@ def stop_ci_poll(ticket_id: str) -> None:
 
 @app.on_event("startup")
 async def _startup_workers() -> None:
+    global _ci_poll_task
     _worker_stop_event.clear()
     for role in _queue_roles():
         if role in _worker_tasks and not _worker_tasks[role].done():
             continue
         _worker_tasks[role] = asyncio.create_task(_agent_worker(role))
-    asyncio.create_task(_ci_poll_worker())
+    if _ci_poll_task is None or _ci_poll_task.done():
+        _ci_poll_task = asyncio.create_task(_ci_poll_worker())
 
 
 @app.on_event("shutdown")
 async def _shutdown_workers() -> None:
+    global _ci_poll_task
     _worker_stop_event.set()
     tasks = [t for t in _worker_tasks.values() if not t.done()]
+    if _ci_poll_task and not _ci_poll_task.done():
+        tasks.append(_ci_poll_task)
     for task in tasks:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     _worker_tasks.clear()
+    _ci_poll_task = None
 
 
 def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
