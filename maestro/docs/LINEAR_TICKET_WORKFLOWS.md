@@ -5,8 +5,8 @@ This document explains how **Hermes `AIAgent` instances**, **Linear issue workfl
 ## Big picture
 
 1. **Linear** is the system of record for work: issues move through workflow states (Backlog → … → Ready For QA → **Ready For Delivery** → *human* **Approved For Delivery** → *human* **Done** / production). Automated agents stop after QA sets **Ready For Delivery**; humans own release sign-off and production **Done**.
-2. **A FastAPI webhook server** (`maestro/webhook_server.py`) receives Linear **Issue** webhooks when an issue’s state changes.
-3. The server maps the **new state name** to a **role** (Product Manager, Developer, Reviewer, or QA) and starts an **`AIAgent`** run in a background task with role-specific **toolsets** and **system prompts**.
+2. **A FastAPI webhook server** (`maestro/webhook_server.py`) receives Linear **Issue** webhooks when an issue’s state changes. It also runs a Product Manager intake scanner so missed webhook events or already-existing intake tickets can still be triaged.
+3. The server maps the **new state name** to a **role** (Product Manager, Developer, Reviewer, or QA) and queues an **`AIAgent`** run with role-specific **toolsets** and **system prompts**.
 4. Each agent uses **Linear tools** (`tools/linear_tool.py`) plus GitHub / terminal / file tools as configured, then typically calls **`linear_update_status`** to move the ticket forward (or back to In Progress). That status change can fire the **next** webhook, which dispatches the **next** role—an event-driven pipeline.
 
 Role text, shared rules, and per-role toolsets are defined in **`maestro/sdlc_roles.yaml`**. You can point the loaders at another file with the environment variable **`SDLC_ROLES_PATH`**.
@@ -28,7 +28,7 @@ States **not** in this map are **ignored** (logged, no agent run) — including 
 
 Details and mandatory step order live in `sdlc_roles.yaml`. Summary:
 
-- **Product Manager** — Linear-only triage: roadmap context, backlog search, acceptance criteria, priority/labels, then move to **Todo** (human gate) or **In Progress** (kicks off Developer). Treats **Approved For Delivery** as **implementation done** (release-approved); **new triage is always allowed** and those tickets do not block routing other work.
+- **Product Manager** — Linear + GitHub triage: roadmap context, backlog search, acceptance criteria, priority/labels, then move to **Todo** (human gate) or, only when the ticket is **AI-Ready**, **In Progress** (kicks off Developer). PM may triage non-AI-Ready tickets but must not start implementation for them. **Triage** is treated as loose raw intake (screenshots, brief bug reports, enquiries, opinions, suggestions); PM classifies and consolidates engineering-worthy reports into backlog-ready tickets before any dev handoff. Treats **Approved For Delivery** as **implementation done** (release-approved); **new triage is always allowed** and those tickets do not block routing other work.
 - **Developer** — Linear + GitHub + terminal + file: branch from `develop`, implement, tests, draft PR, CI, then move to **In Review** when ready.
 - **Reviewer** — Linear + GitHub: validate PR vs ticket, CI gates, review, approve/merge to `develop`, then **Ready For QA** or back to **In Progress** with feedback.
 - **QA** — Linear + GitHub + terminal: verify merged work on `develop`, run checks (including browser/E2E as configured in YAML), post evidence to Linear, then **Ready For Delivery** on success or **In Progress** on failure. **Approved For Delivery** and **Done** are human-only (release approval and production deployment).
@@ -65,13 +65,40 @@ The webhook server resolves the same **model and provider runtime** as the rest 
 - **`LINEAR_API_KEY`**: used by the server for optional GraphQL helpers (labels/comments on lock conflict paths) and by agents via tools.
 - **`LINEAR_BOT_USER_ID`**: present for future filtering; webhook logic does not blanket-ignore bot updates (state mapping drives dispatch, including forward transitions such as Developer → In Review).
 
-## Concurrency: ticket locks
+## Product Manager intake scanner
 
-`maestro/webhook_server.py` uses **`ConcurrencyManager`** (`agent/concurrency.py`) with a SQLite DB (default **`agent_state.db`** next to the process working directory) to record **one active “owner” role per ticket**.
+Product Manager work is no longer only webhook-driven. The server also runs a configurable scanner that periodically searches recently updated Linear tickets for Product Manager intake states:
+
+- Backlog
+- New
+- Todo
+- Unstarted
+- Triage
+
+The scanner enqueues Product Manager tasks for both **AI-Ready** and non-**AI-Ready** tickets. Existing queue deduplication prevents repeated PM runs for the same ticket/state.
+
+Default environment controls:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PM_SCANNER_ENABLED` | `true` | Enable/disable proactive PM intake scanning |
+| `PM_SCANNER_INTERVAL_SECONDS` | `900` | Delay between scans |
+| `PM_SCANNER_LIMIT` | `50` | Max Linear candidates fetched per scan |
+
+PM routing rules:
+
+- Non-AI-Ready tickets may be clarified, labeled, prioritized, consolidated, and moved to **Todo**, but must not move to **In Progress**.
+- AI-Ready tickets may move to **In Progress** only after PM has made them actionable enough for Developer.
+- Raw **Triage** tickets should be classified first. If they need engineering work, PM posts a structured consolidation comment with problem statement, evidence/source, repro steps when applicable, expected vs actual behavior for bugs, proposed scope, acceptance criteria, duplicate/dependency check, labels, and priority.
+
+## Concurrency: ticket locks and active ticket cap
+
+`maestro/webhook_server.py` uses **`ConcurrencyManager`** (`agent/concurrency.py`) with a SQLite DB to record **one active “owner” role per ticket**. The default DB path is the repository-root **`agent_state.db`**, computed from `webhook_server.py`, so it does not depend on the current working directory. Override it with **`HERMES_AGENT_STATE_DB`** if needed.
 
 - **Forward transitions** (e.g. In Review → Ready For QA): if another role still holds the lock, the server can **`release_and_acquire`** so the finishing agent’s webhook races cleanly against lock release.
 - **Backward transitions to In Progress** (rejections, QA failures): **lock check is skipped** so the Developer can be scheduled again without deadlock.
 - **Stale locks** expire after a timeout (default 30 minutes) so a crashed run does not block forever.
+- **Global active-ticket cap** defaults to **1** via `HERMES_MAX_ACTIVE_TICKETS=1`. Queue workers may accumulate many queued tasks, but only one distinct ticket should be actively locked/running at a time. This avoids codebase conflicts between concurrent tickets.
 
 **Manual recovery:** `DELETE /agent-lock/{ticket_id}` clears a stuck lock; `GET /agent-lock/{ticket_id}` inspects it.
 
@@ -87,7 +114,7 @@ The **`pipeline_orchestrator`** demo script manipulates an in-memory retry count
 
 `POST /trigger-agent` accepts JSON:
 
-- **`role`**: `Developer`, `Reviewer`, or `QA` (not Product Manager in this endpoint).
+- **`role`**: `Product Manager`, `Developer`, `Reviewer`, or `QA`.
 - **`ticket_id`**: e.g. `FAW-26`.
 - **`prompt`**: optional; default prompts the role for that ticket.
 

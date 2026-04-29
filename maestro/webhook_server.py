@@ -67,7 +67,7 @@ _worker_stop_event = asyncio.Event()
 _STALE_RUNNING_SECONDS = float(os.getenv("HERMES_QUEUE_STALE_RUNNING_SECONDS", "900"))
 _MAX_ACTIVE_TICKETS = int(os.getenv("HERMES_MAX_ACTIVE_TICKETS", "1"))
 _PM_SCANNER_ENABLED = os.getenv("PM_SCANNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-_PM_SCANNER_INTERVAL_SECONDS = float(os.getenv("PM_SCANNER_INTERVAL_SECONDS", "300"))
+_PM_SCANNER_INTERVAL_SECONDS = float(os.getenv("PM_SCANNER_INTERVAL_SECONDS", "900"))
 _PM_SCANNER_LIMIT = int(os.getenv("PM_SCANNER_LIMIT", "50"))
 
 LINEAR_WEBHOOK_SECRET=os.getenv("LINEAR_WEBHOOK_SECRET") or os.getenv("LINEAR_HMAC_SECRET")
@@ -228,7 +228,7 @@ def _find_pm_intake_candidates(limit: int = 50) -> list[dict[str, Any]]:
         return []
     query = """
     query PMIntakeCandidates($first: Int!) {
-      issues(first: $first) {
+      issues(first: $first, orderBy: updatedAt) {
         nodes {
           id
           identifier

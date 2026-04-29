@@ -46,25 +46,37 @@ pipeline:
       2. Use 'linear_search_tickets' to look at other tickets in the 'Backlog' and 'In Progress' states.
       3. Analyze the new ticket's type and see if it has dependencies on existing in-progress work or if it duplicates an existing backlog item.
       4. If the ticket description is vague, add a comment asking the reporter for clarification. Ensure the ticket has clear Acceptance Criteria.
-      5. Assign an appropriate priority (1=Urgent, 2=High, 3=Medium, 4=Low) based on the business impact and the project roadmap context.
-      6. Add relevant labels (e.g., 'bug', 'feature', 'backend').
-      7. Move the ticket to 'Todo' (for human review) or, only if it has 'AI-Ready', to 'In Progress' (to immediately trigger the Developer agent).
+      5. Handle Linear **Triage** loosely:
+         - Treat Triage as raw intake from third parties. Content may be only a screenshot,
+           a brief bug report, an enquiry, an opinion, or a suggestion.
+         - First classify the input as one of: bug report, feature suggestion, product enquiry,
+           user opinion/feedback, duplicate, spam/irrelevant, or unclear.
+         - If it is only enquiry/opinion/feedback and does not require engineering work,
+           summarize the interpretation, add appropriate labels/priority, and move it to
+           'Todo' or leave a clarification comment. Do NOT move it to 'In Progress'.
+         - If it appears to need engineering work, consolidate the raw Triage content into a
+           backlog-ready ticket before any developer handoff. Post a structured PM comment
+           containing: problem statement, evidence/source (screenshot or report summary),
+           reproduction steps if applicable, expected vs actual behavior for bugs, proposed
+           scope, acceptance criteria, dependencies/duplicates checked, labels, and priority.
+         - If the consolidated ticket is NOT AI-Ready, keep it out of implementation by moving
+           it only to 'Todo' (or another intake/backlog state) and request missing details.
+         - Only if the consolidated ticket is AI-Ready and sufficiently actionable may you move
+           it to 'In Progress' to trigger Developer.
+      6. Assign an appropriate priority (1=Urgent, 2=High, 3=Medium, 4=Low) based on the business impact and the project roadmap context.
+      7. Add relevant labels (e.g., 'bug', 'feature', 'backend', 'enquiry', 'feedback', 'needs-clarification').
+      8. Move the ticket to 'Todo' (for human review) or, only if it has 'AI-Ready', to 'In Progress' (to immediately trigger the Developer agent).
          IMPORTANT: linear_update_status MUST be your LAST action. Do nothing after it.
-      8. Linear delivery states (for triage / dependency analysis):
+      9. Linear delivery states (for triage / dependency analysis):
          - **Ready For Delivery** — QA passed automated verification on `develop`; awaits **human** release approval (only humans promote from here when ready).
          - **Approved For Delivery** — human approved release readiness. Treat this as **implementation done** for the SDLC: the change is accepted for delivery, `develop` work is finished from a triage perspective, and it does **not** consume implementation capacity. **New triage is always allowed** — prioritize and route other tickets normally; do not treat Approved For Delivery tickets as blockers for moving new work to Todo or In Progress.
          - **Done** — deployed to production (only humans set this after deployment). Means **live in production**, not merely merged to `develop`.
          For duplicate detection and roadmap context, **Approved For Delivery** and **Done** are "shipped or release-approved" milestones; **Ready For Delivery** is "QA passed, pending human release sign-off."
          A ticket is blocked only when the workflow state is explicitly 'Blocked' OR it has the 'needs-human' label.
-      9. For EVERY ticket you triage (new, Backlog, Todo, In Progress, Done, Ready For Delivery), check the linked PR's base branch before finishing triage:
-         a. Extract the PR URL from the Linear ticket's attachments or pullRequest field.
-         b. Call github_get_pr(repo, pr_number) to get the PR details.
-         c. If baseRefName is 'develop': the work is correctly integrated — take no action.
-         d. If baseRefName is NOT 'develop': the work is not in the integration branch. Remove the 'needs-human' label if present. Then move the ticket to 'In Progress' immediately using linear_update_status. This triggers Developer to cherry-pick the commit from the wrong branch onto `develop`. Do NOT skip this step.
       10. If the ticket has a 'needs-human' label, remove it — it is an automated SDLC ticket, not a human-escalated one.
       Do not write application code.
     prompt: |
-      Ticket {{ticket_id}} has been created or moved to an intake state. Please read it, review the project roadmap and active backlog for context, ensure it has acceptance criteria, assign priority and labels, and route it appropriately. If it has 'AI-Ready', you may move it to 'In Progress'; if it does not have 'AI-Ready', triage it but keep it out of implementation by moving it only to 'Todo' or leaving a clarification comment. Post a summary of your triage and the rationale for the priority based on current projects.
+      Ticket {{ticket_id}} has been created or moved to an intake state. If it is in Triage, treat it as loose raw intake: it may be only a screenshot, brief bug report, enquiry, opinion, or suggestion. Classify it, check roadmap/backlog context, and if engineering work is needed, consolidate it into a backlog-ready ticket by posting a structured PM comment with problem statement, evidence, repro/expected/actual when applicable, proposed scope, acceptance criteria, duplicate/dependency check, labels, and priority. If it has 'AI-Ready' and is actionable, you may move it to 'In Progress'; if it does not have 'AI-Ready', triage it but keep it out of implementation by moving it only to 'Todo' or another intake/backlog state, or leaving a clarification comment. Post a summary of your triage and the rationale for the priority based on current projects.
 
   - agent_key: Developer
     toolsets:
