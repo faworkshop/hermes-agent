@@ -294,11 +294,41 @@ class ConcurrencyManager:
             ).fetchone()
             return True, dict(row) if row else {}
 
-    def claim_next_task(self, role: str, *, session_id: str) -> Optional[dict[str, Any]]:
+    def claim_next_task(
+        self,
+        role: str,
+        *,
+        session_id: str,
+        max_active_tickets: int = 0,
+        active_timeout_seconds: float = 1800.0,
+    ) -> Optional[dict[str, Any]]:
         """Atomically claim the next queued task for a role."""
         now = time.time()
+        cutoff = now - max(1.0, float(active_timeout_seconds))
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if max_active_tickets > 0:
+                active = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT ticket_id) AS n
+                    FROM (
+                        SELECT ticket_id
+                        FROM locks
+                        WHERE locked_at > ?
+                        UNION
+                        SELECT ticket_id
+                        FROM agent_tasks
+                        WHERE state = 'running'
+                          AND started_at IS NOT NULL
+                          AND started_at > ?
+                    )
+                    """,
+                    (cutoff, cutoff),
+                ).fetchone()
+                if int((active or {"n": 0})["n"]) >= max_active_tickets:
+                    conn.execute("ROLLBACK")
+                    return None
+
             row = conn.execute(
                 """
                 SELECT id

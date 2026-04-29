@@ -57,11 +57,18 @@ if not logger.handlers:
     logger.addHandler(_file)
 
 app = FastAPI(title="Hermes Webhook Server")
-cm = ConcurrencyManager()
+_DEFAULT_AGENT_DB_PATH = str((Path(__file__).resolve().parent.parent / "agent_state.db"))
+_AGENT_DB_PATH = os.getenv("HERMES_AGENT_STATE_DB", _DEFAULT_AGENT_DB_PATH)
+cm = ConcurrencyManager(db_path=_AGENT_DB_PATH)
 _worker_tasks: dict[str, asyncio.Task] = {}
 _ci_poll_task: asyncio.Task | None = None
+_pm_scanner_task: asyncio.Task | None = None
 _worker_stop_event = asyncio.Event()
 _STALE_RUNNING_SECONDS = float(os.getenv("HERMES_QUEUE_STALE_RUNNING_SECONDS", "900"))
+_MAX_ACTIVE_TICKETS = int(os.getenv("HERMES_MAX_ACTIVE_TICKETS", "1"))
+_PM_SCANNER_ENABLED = os.getenv("PM_SCANNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+_PM_SCANNER_INTERVAL_SECONDS = float(os.getenv("PM_SCANNER_INTERVAL_SECONDS", "300"))
+_PM_SCANNER_LIMIT = int(os.getenv("PM_SCANNER_LIMIT", "50"))
 
 LINEAR_WEBHOOK_SECRET=os.getenv("LINEAR_WEBHOOK_SECRET") or os.getenv("LINEAR_HMAC_SECRET")
 LINEAR_BOT_USER_ID = os.getenv("LINEAR_BOT_USER_ID")
@@ -130,6 +137,11 @@ _STATE_AGENT_BY_NORMALIZED = {
 
 # Public alias (canonical labels) for operators extending the map.
 STATE_AGENT_MAPPING = dict(_STATE_AGENT_MAPPING_RAW)
+_PM_INTAKE_STATES = {
+    _normalize_linear_state_name(k)
+    for k, v in _STATE_AGENT_MAPPING_RAW.items()
+    if v == "Product Manager"
+}
 
 ROLE_TOOLSETS = {
     "Product Manager": ["linear"],
@@ -202,6 +214,39 @@ def _issue_has_label(linear_issue_uuid: str, label_name: str) -> bool:
     labels = issue.get("labels", {}).get("nodes", []) or []
     want = label_name.strip().casefold()
     return any(((lbl.get("name") or "").strip().casefold() == want) for lbl in labels)
+
+
+def _find_pm_intake_candidates(limit: int = 50) -> list[dict[str, Any]]:
+    """Return Linear issues in PM-owned intake states.
+
+    PM is allowed to triage both AI-Ready and non-AI-Ready tickets. The agent
+    rules prevent non-AI-Ready tickets from moving into implementation.
+    This scanner intentionally over-fetches and filters states locally to avoid
+    depending on Linear state-name filter edge cases.
+    """
+    if not LINEAR_API_KEY:
+        return []
+    query = """
+    query PMIntakeCandidates($first: Int!) {
+      issues(first: $first) {
+        nodes {
+          id
+          identifier
+          state { name }
+          labels { nodes { name } }
+        }
+      }
+    }
+    """
+    data = _linear_gql(query, {"first": max(1, min(int(limit), 250))})
+    nodes = (data or {}).get("issues", {}).get("nodes") or []
+    candidates: list[dict[str, Any]] = []
+    for issue in nodes:
+        state_name = ((issue.get("state") or {}).get("name") or "").strip()
+        if _normalize_linear_state_name(state_name) not in _PM_INTAKE_STATES:
+            continue
+        candidates.append(issue)
+    return candidates
 
 def _add_needs_human_label(ticket_id: str, blocked_role: str) -> None:
     """Add the needs-human label to a ticket. Idempotent — no error if already present."""
@@ -357,7 +402,12 @@ async def _agent_worker(role: str) -> None:
                 )
 
             worker_session_id = f"{role}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-            task = cm.claim_next_task(role, session_id=worker_session_id)
+            task = cm.claim_next_task(
+                role,
+                session_id=worker_session_id,
+                max_active_tickets=_MAX_ACTIVE_TICKETS,
+                active_timeout_seconds=_STALE_RUNNING_SECONDS,
+            )
             if not task:
                 await asyncio.sleep(0.8)
                 continue
@@ -561,6 +611,67 @@ async def _ci_poll_worker() -> None:
             await asyncio.sleep(2.0)
 
 
+async def _pm_intake_scanner_worker() -> None:
+    """Periodically enqueue missed intake tickets for Product Manager."""
+    logger.info(
+        "Starting PM intake scanner enabled=%s interval=%ss limit=%s",
+        _PM_SCANNER_ENABLED,
+        _PM_SCANNER_INTERVAL_SECONDS,
+        _PM_SCANNER_LIMIT,
+    )
+    while not _worker_stop_event.is_set():
+        try:
+            if not _PM_SCANNER_ENABLED:
+                await asyncio.sleep(max(5.0, _PM_SCANNER_INTERVAL_SECONDS))
+                continue
+
+            candidates = _find_pm_intake_candidates(_PM_SCANNER_LIMIT)
+            queued = 0
+            for issue in candidates:
+                ticket_id = (issue.get("identifier") or "").strip()
+                state_name = ((issue.get("state") or {}).get("name") or "").strip()
+                if not ticket_id or not state_name:
+                    continue
+
+                state_key = _normalize_linear_state_name(state_name)
+                dedup_key = f"{ticket_id}:Product Manager:{state_key}"
+                labels = (issue.get("labels") or {}).get("nodes") or []
+                has_ai_ready = any(
+                    ((lbl.get("name") or "").strip().casefold() == "ai-ready")
+                    for lbl in labels
+                )
+                prompt = (
+                    f"Ticket {ticket_id} is currently in '{state_name}' "
+                    f"and {'has' if has_ai_ready else 'does not have'} AI-Ready. "
+                    "Please perform your duties as Product Manager. "
+                    "Do not move non-AI-Ready tickets to In Progress."
+                )
+                created, task_row = cm.enqueue_task(
+                    ticket_id,
+                    "Product Manager",
+                    prompt,
+                    dedup_key=dedup_key,
+                    source_state=state_key,
+                )
+                if created:
+                    queued += 1
+                    logger.info(
+                        "PM scanner queued ticket=%s state=%r task_id=%s",
+                        ticket_id,
+                        state_name,
+                        task_row.get("id"),
+                    )
+
+            if candidates:
+                logger.info("PM scanner checked %d candidate(s), queued %d", len(candidates), queued)
+            await asyncio.sleep(max(5.0, _PM_SCANNER_INTERVAL_SECONDS))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("PM intake scanner loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(2.0)
+
+
 def _post_linear_comment(ticket_id: str, body: str) -> None:
     """Post a comment to a Linear issue."""
     mutation = """
@@ -632,7 +743,7 @@ def stop_ci_poll(ticket_id: str) -> None:
 
 @app.on_event("startup")
 async def _startup_workers() -> None:
-    global _ci_poll_task
+    global _ci_poll_task, _pm_scanner_task
     _worker_stop_event.clear()
     for role in _queue_roles():
         if role in _worker_tasks and not _worker_tasks[role].done():
@@ -640,21 +751,26 @@ async def _startup_workers() -> None:
         _worker_tasks[role] = asyncio.create_task(_agent_worker(role))
     if _ci_poll_task is None or _ci_poll_task.done():
         _ci_poll_task = asyncio.create_task(_ci_poll_worker())
+    if _pm_scanner_task is None or _pm_scanner_task.done():
+        _pm_scanner_task = asyncio.create_task(_pm_intake_scanner_worker())
 
 
 @app.on_event("shutdown")
 async def _shutdown_workers() -> None:
-    global _ci_poll_task
+    global _ci_poll_task, _pm_scanner_task
     _worker_stop_event.set()
     tasks = [t for t in _worker_tasks.values() if not t.done()]
     if _ci_poll_task and not _ci_poll_task.done():
         tasks.append(_ci_poll_task)
+    if _pm_scanner_task and not _pm_scanner_task.done():
+        tasks.append(_pm_scanner_task)
     for task in tasks:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     _worker_tasks.clear()
     _ci_poll_task = None
+    _pm_scanner_task = None
 
 
 def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
@@ -764,7 +880,7 @@ async def linear_webhook(request: Request):
             return _log_ignored("CI-Poll: no branch/PR found for ticket", ticket=ticket_id)
 
     linear_issue_uuid = _linear_issue_uuid_for_api(data, ticket_id)
-    if role in {"Product Manager", "Developer", "Reviewer", "QA"}:
+    if role in {"Developer", "Reviewer", "QA"}:
         if not linear_issue_uuid:
             logger.warning(
                 "Cannot resolve Linear issue UUID for identifier=%r — skipping AI-Ready check "
@@ -905,7 +1021,7 @@ async def trigger_agent(
     """Manually trigger an SDLC agent without requiring a Linear status change.
 
     Body (JSON):
-        role: Which agent to run — "Developer", "Reviewer", or "QA"
+        role: Which agent to run — "Product Manager", "Developer", "Reviewer", or "QA"
         ticket_id: Linear ticket identifier, e.g. "FAW-26"
         prompt: Optional custom prompt. If omitted, a default is constructed from
                 the ticket_id and role.
@@ -924,7 +1040,7 @@ async def trigger_agent(
     ticket_id = (payload.get("ticket_id") or "").strip()
     prompt = payload.get("prompt")
 
-    valid_roles = {"Developer", "Reviewer", "QA"}
+    valid_roles = {"Product Manager", "Developer", "Reviewer", "QA"}
     if role not in valid_roles:
         raise HTTPException(
             status_code=400,
