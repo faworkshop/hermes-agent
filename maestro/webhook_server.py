@@ -367,28 +367,29 @@ async def run_agent_task(
         )
         if hard_timeout_seconds is not None and hard_timeout_seconds > 0:
             try:
-                await asyncio.wait_for(asyncio.shield(future), timeout=hard_timeout_seconds)
+                await asyncio.wait_for(future, timeout=hard_timeout_seconds)
             except asyncio.TimeoutError:
                 logger.warning(
                     "Hard timeout reached for %s Agent on %s (%.0fs). "
                     "Killing agent and requeueing task.",
                     role, ticket_id, hard_timeout_seconds,
                 )
-                # Cancel the in-progress agent run
                 future.cancel()
                 try:
                     await future
                 except asyncio.CancelledError:
                     pass
+                except Exception:
+                    pass
                 # Requeue the task so another worker can pick it up
-                cm.requeue_task(
-                    cm.get_task_by_ticket(ticket_id, role)["id"],
-                    delay_seconds=30.0,
-                    error=f"Hard timeout after {hard_timeout_seconds}s — agent exceeded allowed runtime",
-                )
+                active_task = cm.get_task_by_ticket(ticket_id, role)
+                if active_task and active_task.get("id"):
+                    cm.requeue_task(
+                        active_task["id"],
+                        delay_seconds=30.0,
+                        error=f"Hard timeout after {hard_timeout_seconds}s — agent exceeded allowed runtime",
+                    )
                 return False
-        else:
-            await future
     except asyncio.CancelledError:
         logger.warning("Agent task cancelled for %s/%s", role, ticket_id)
         raise
