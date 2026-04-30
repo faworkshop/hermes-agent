@@ -630,7 +630,53 @@ async def _ci_poll_worker() -> None:
                             f"✅ CI checks passed on branch `{ci.get('branch', 'unknown')}` — "
                             f"ticket moved to In Progress.",
                         )
-                        expired.append(ticket_id)
+                        expired.append(tid)
+                    elif ci.get("all_passed") is False:
+                        # CI failed — keep Developer on the ticket in In Progress.
+                        # Do NOT add needs-human label — Developer can and should fix it.
+                        # Keep polling: when Developer pushes a fix, CI will eventually pass.
+                        # Re-dispatch Developer with CI failure details so they know what to fix.
+                        failed_names = [
+                            r["name"] for r in ci.get("runs", [])
+                            if r.get("conclusion") == "failure"
+                        ]
+                        logger.warning(
+                            "CI FAILED for %s — Developer stays on ticket, keeping poll active",
+                            ticket_id,
+                        )
+                        _post_linear_comment(
+                            ticket_id,
+                            f"❌ CI failed on branch `{ci.get('branch', 'unknown')}`: "
+                            f"{', '.join(failed_names)}. "
+                            f"Developer will fix and re-push.",
+                        )
+                        # Re-dispatch Developer so they are immediately notified and can act.
+                        # Dedup key matches the webhook-triggered Developer dispatch so a new
+                        # task is only created if no active Developer task exists.
+                        dev_dedup_key = f"{ticket_id}:Developer:in progress"
+                        dev_prompt = (
+                            f"CI failed on branch `{ci.get('branch', 'unknown')}`: "
+                            f"{', '.join(failed_names)}. "
+                            f"Please fix the failures and push a new commit to re-trigger CI."
+                        )
+                        created, _ = cm.enqueue_task(
+                            ticket_id,
+                            "Developer",
+                            dev_prompt,
+                            dedup_key=dev_dedup_key,
+                            source_state="in progress",
+                        )
+                        if created:
+                            logger.info(
+                                "CI failure re-dispatched Developer for %s (task enqueued)",
+                                ticket_id,
+                            )
+                        else:
+                            logger.info(
+                                "CI failure: active Developer task exists for %s — no new task enqueued",
+                                ticket_id,
+                            )
+                        # Do NOT expired.append(tid) — keep polling
 
                 for tid in expired:
                     _ci_polling_tickets.pop(tid, None)
@@ -717,6 +763,69 @@ def _post_linear_comment(ticket_id: str, body: str) -> None:
     }
     """
     _linear_gql(mutation, {"input": {"issueId": ticket_id, "body": body}})
+
+
+def _add_linear_label(ticket_id: str, label_name: str) -> bool:
+    """Add a label to a Linear issue by name. Creates the label if it doesn't exist."""
+    # First try to find the label ID by name
+    query = """
+    query Organization($teamId: String!) {
+      team(id: $teamId) {
+        issueLabels(first: 100) {
+          nodes { id name }
+        }
+      }
+    }
+    """
+    issue_query = """
+    query Issue($id: String!) {
+      issue(id: $id) { team { id } }
+    }
+    """
+    issue_result = _linear_gql(issue_query, {"id": ticket_id})
+    if not issue_result:
+        return False
+    team_id = issue_result.get("issue", {}).get("team", {}).get("id")
+    if not team_id:
+        return False
+
+    label_result = _linear_gql(query, {"teamId": team_id})
+    if not label_result:
+        return False
+
+    label_nodes = label_result.get("team", {}).get("issueLabels", {}).get("nodes", [])
+    label_id = None
+    for label in label_nodes:
+        if label["name"].lower() == label_name.lower():
+            label_id = label["id"]
+            break
+
+    if not label_id:
+        # Create the label
+        create_mutation = """
+        mutation LabelCreate($teamId: String!, $name: String!) {
+          issueLabelCreate(input: {teamId: $teamId, name: $name}) {
+            success issueLabel { id }
+          }
+        }
+        """
+        create_result = _linear_gql(create_mutation, {"teamId": team_id, "name": label_name})
+        if not create_result:
+            return False
+        label_id = create_result.get("issueLabelCreate", {}).get("issueLabel", {}).get("id")
+        if not label_id:
+            return False
+
+    # Add label to issue
+    add_mutation = """
+    mutation IssueAddLabel($id: String!, $labelId: String!) {
+      issueAddLabel(id: $id, labelId: $labelId) { success }
+    }
+    """
+    result = _linear_gql(add_mutation, {"id": ticket_id, "labelId": label_id})
+    if result:
+        logger.info("Added label '%s' to ticket %s", label_name, ticket_id)
+    return bool(result)
 
 
 def _move_linear_ticket_state(ticket_id: str, state_id: str) -> bool:
