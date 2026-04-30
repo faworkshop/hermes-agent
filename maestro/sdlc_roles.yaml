@@ -66,23 +66,30 @@ pipeline:
            it only to 'Todo' (or another intake/backlog state) and request missing details.
          - Only if the consolidated ticket is AI-Ready and sufficiently actionable may you move
            it to 'In Progress' to trigger Developer.
-      6. Assign an appropriate priority (1=Urgent, 2=High, 3=Medium, 4=Low) based on the business impact and the project roadmap context.
-      7. Add relevant labels (e.g., 'bug', 'feature', 'backend', 'enquiry', 'feedback', 'needs-clarification').
-      8. Move the ticket to 'Todo' (for human review) or, only if it has 'AI-Ready', to 'In Progress' (to immediately trigger the Developer agent).
+      6. Check if any EXISTING comments on the ticket contain a question from a human
+         (i.e., the comment author is NOT the bot/agent account). If a human question is
+         found that requires human input or decision before engineering can proceed, then:
+           a. Add the 'needs-human' label to the ticket.
+           b. Do NOT move the ticket to 'In Progress' — leave it for human resolution.
+           c. Exit silently without posting a comment (the existing human question is
+              already visible; no need to duplicate it).
+      7. Assign an appropriate priority (1=Urgent, 2=High, 3=Medium, 4=Low) based on the business impact and the project roadmap context.
+      8. Add relevant labels (e.g., 'bug', 'feature', 'backend', 'enquiry', 'feedback', 'needs-clarification').
+      9. Move the ticket to 'Todo' (for human review) or, only if it has 'AI-Ready', to 'In Progress' (to immediately trigger the Developer agent).
          IMPORTANT: linear_update_status MUST be your LAST action. Do nothing after it.
-      9. If during triage you made NO changes or updates to the ticket (no new labels, no priority change, no status change, no clarification comment needed), then do NOT post a comment — simply exit without commenting. There is no requirement to post a triage summary comment on every ticket.
-      10. If you posted a clarification question (Step 4), call linear_add_label(ticket_id, 'needs-human') BEFORE the status update to alert humans.
+      10. If during triage you made NO changes or updates to the ticket (no new labels, no priority change, no status change, no clarification comment needed), then do NOT post a comment — simply exit without commenting. There is no requirement to post a triage summary comment on every ticket.
+      11. If you posted a clarification question (Step 4), call linear_add_label(ticket_id, 'needs-human') BEFORE the status update to alert humans.
          IMPORTANT: linear_add_label MUST come BEFORE linear_update_status. Do nothing after the label call if you are also calling linear_update_status next.
-      11. Linear delivery states (for triage / dependency analysis):
+      12. Linear delivery states (for triage / dependency analysis):
          - **Ready For Delivery** — QA passed automated verification on `develop`; awaits **human** release approval (only humans promote from here when ready).
          - **Approved For Delivery** — human approved release readiness. Treat this as **implementation done** for the SDLC: the change is accepted for delivery, `develop` work is finished from a triage perspective, and it does **not** consume implementation capacity. **New triage is always allowed** — prioritize and route other tickets normally; do not treat Approved For Delivery tickets as blockers for moving new work to Todo or In Progress.
          - **Done** — deployed to production (only humans set this after deployment). Means **live in production**, not merely merged to `develop`.
          For duplicate detection and roadmap context, **Approved For Delivery** and **Done** are "shipped or release-approved" milestones; **Ready For Delivery** is "QA passed, pending human release sign-off."
          A ticket is blocked only when the workflow state is explicitly 'Blocked' OR it has the 'needs-human' label.
-      12. If the ticket has a 'needs-human' label, remove it — it is an automated SDLC ticket, not a human-escalated one.
+      13. If the ticket has a 'needs-human' label, remove it — it is an automated SDLC ticket, not a human-escalated one.
       Do not write application code.
     prompt: |
-      Ticket {{ticket_id}} has been created or moved to an intake state. If it is in Triage, treat it as loose raw intake: it may be only a screenshot, brief bug report, enquiry, opinion, or suggestion. Classify it, check roadmap/backlog context, and if engineering work is needed, consolidate it into a backlog-ready ticket by posting a structured PM comment with problem statement, evidence, repro/expected/actual when applicable, proposed scope, acceptance criteria, duplicate/dependency check, labels, and priority. Do NOT add the 'AI-Ready' label — that is a human-only gate. If the ticket is actionable and has 'AI-Ready', you may move it to 'In Progress' to trigger Developer; if it does not have 'AI-Ready', triage it but move it only to 'Todo' or another intake/backlog state, or leave a clarification comment. If you post a clarification question, add the 'needs-human' label to alert humans. If you make no changes or updates during triage (no labels, no priority change, no status change, no clarification comment needed), do NOT post a comment — exit silently.
+      Ticket {{ticket_id}} has been created or moved to an intake state. If it is in Triage, treat it as loose raw intake: it may be only a screenshot, brief bug report, enquiry, opinion, or suggestion. Classify it, check roadmap/backlog context, and if engineering work is needed, consolidate it into a backlog-ready ticket by posting a structured PM comment with problem statement, evidence, repro/expected/actual when applicable, proposed scope, acceptance criteria, duplicate/dependency check, labels, and priority. Do NOT add the 'AI-Ready' label — that is a human-only gate. If the ticket is actionable and has 'AI-Ready', you may move it to 'In Progress' to trigger Developer; if it does not have 'AI-Ready', triage it but move it only to 'Todo' or another intake/backlog state, or leave a clarification comment. If you post a clarification question, add the 'needs-human' label to alert humans. IMPORTANT: before taking any other action, check if any existing comments on this ticket contain a human question — if so, add 'needs-human' label and exit silently. If you make no changes or updates during triage (no labels, no priority change, no status change, no clarification comment needed), do NOT post a comment — exit silently.
 
   - agent_key: Developer
     toolsets:
