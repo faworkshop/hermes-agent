@@ -445,6 +445,24 @@ class ConcurrencyManager:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_task_by_ticket(self, ticket_id: str, role: str) -> Optional[dict[str, Any]]:
+        """Get the active (queued/running) task for a ticket+role, if any."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    id, ticket_id, role, prompt, state, dedup_key, source_state,
+                    session_id, attempts, next_run_at, last_error,
+                    created_at, updated_at, started_at, finished_at
+                FROM agent_tasks
+                WHERE ticket_id = ? AND role = ? AND state IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(ticket_id), str(role)),
+            ).fetchone()
+            return dict(row) if row else None
+
     def recover_stale_running_tasks(
         self,
         *,

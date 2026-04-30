@@ -319,18 +319,17 @@ def verify_linear_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(computed_signature, signature)
 
 
-async def run_agent_task(role: str, ticket_id: str, prompt: str, session_id: str = None) -> bool:
+async def run_agent_task(
+    role: str, ticket_id: str, prompt: str, session_id: str = None,
+    hard_timeout_seconds: float = None,
+) -> bool:
     if role in ["Developer", "Reviewer", "QA"]:
         retries = cm.get_retry_count(ticket_id)
         if retries >= 3:
-            logger.error(f"🚨 Circuit Breaker Tripped for {ticket_id}. Max retries reached.")
+            logger.error(f"Circuit Breaker Tripped for {ticket_id}. Max retries reached.")
             return False
 
-    # Lock already acquired in the foreground before this background task was queued.
-    # Skip the duplicate acquire here — just release it when done.
-    # (We still record the role so release_lock knows who to release.)
-
-    logger.info(f"Starting {role} Agent for {ticket_id}")
+    logger.info(f"Starting {role} Agent for {ticket_id} (timeout=%ss)", hard_timeout_seconds)
 
     # Load system message and toolsets from sdlc_roles.yaml
     cfg = load_sdlc_config()
@@ -362,10 +361,37 @@ async def run_agent_task(role: str, ticket_id: str, prompt: str, session_id: str
             session_id=session_id,
         )
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
+        future = loop.run_in_executor(
             None,
             lambda: agent.run_conversation(user_message=prompt, system_message=system_message),
         )
+        if hard_timeout_seconds is not None and hard_timeout_seconds > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=hard_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Hard timeout reached for %s Agent on %s (%.0fs). "
+                    "Killing agent and requeueing task.",
+                    role, ticket_id, hard_timeout_seconds,
+                )
+                # Cancel the in-progress agent run
+                future.cancel()
+                try:
+                    await future
+                except asyncio.CancelledError:
+                    pass
+                # Requeue the task so another worker can pick it up
+                cm.requeue_task(
+                    cm.get_task_by_ticket(ticket_id, role)["id"],
+                    delay_seconds=30.0,
+                    error=f"Hard timeout after {hard_timeout_seconds}s — agent exceeded allowed runtime",
+                )
+                return False
+        else:
+            await future
+    except asyncio.CancelledError:
+        logger.warning("Agent task cancelled for %s/%s", role, ticket_id)
+        raise
     except Exception as e:
         logger.error(f"Error running {role} Agent for {ticket_id}: {e}")
         return False
@@ -426,7 +452,10 @@ async def _agent_worker(role: str) -> None:
                 continue
 
             try:
-                ok = await run_agent_task(role, ticket_id, prompt, session_id=session_id)
+                ok = await run_agent_task(
+                    role, ticket_id, prompt, session_id=session_id,
+                    hard_timeout_seconds=_STALE_RUNNING_SECONDS,
+                )
                 cm.complete_task(task_id, success=ok, error=None if ok else "Agent run failed")
             except Exception as exc:
                 logger.error("Worker %s failed task %s: %s", role, task_id, exc, exc_info=True)
@@ -640,6 +669,13 @@ async def _pm_intake_scanner_worker() -> None:
                     ((lbl.get("name") or "").strip().casefold() == "ai-ready")
                     for lbl in labels
                 )
+                has_needs_human = any(
+                    ((lbl.get("name") or "").strip().casefold() == "needs-human")
+                    for lbl in labels
+                )
+                if has_needs_human:
+                    logger.debug("PM scanner skipping %s — has needs-human label", ticket_id)
+                    continue
                 prompt = (
                     f"Ticket {ticket_id} is currently in '{state_name}' "
                     f"and {'has' if has_ai_ready else 'does not have'} AI-Ready. "
@@ -682,7 +718,7 @@ def _post_linear_comment(ticket_id: str, body: str) -> None:
     _linear_gql(mutation, {"input": {"issueId": ticket_id, "body": body}})
 
 
-def _move_linear_ticket_state(ticket_id: str, state_id: str) -> None:
+def _move_linear_ticket_state(ticket_id: str, state_id: str) -> bool:
     """Move a Linear issue to a specific state by state ID."""
     mutation = """
     mutation UpdateState($id: String!, $stateId: String!) {
@@ -692,8 +728,10 @@ def _move_linear_ticket_state(ticket_id: str, state_id: str) -> None:
     result = _linear_gql(mutation, {"id": ticket_id, "stateId": state_id})
     if result:
         logger.info("Moved ticket %s to state %s", ticket_id, state_id)
+        return True
     else:
         logger.error("Failed to move ticket %s to state %s", ticket_id, state_id)
+        return False
 
 
 def _get_in_progress_state_id(ticket_id: str) -> str | None:
@@ -739,6 +777,67 @@ def start_ci_poll(ticket_id: str, pr_number: int, owner: str, repo: str, branch:
 
 def stop_ci_poll(ticket_id: str) -> None:
     _ci_polling_tickets.pop(ticket_id, None)
+
+
+def _redirect_to_ci_in_progress(
+    ticket_id: str, pr_number: int, owner: str, repo: str,
+    branch: str, data: Dict[str, Any],
+) -> None:
+    """Move ticket to 'CI in Progress' and start server-side CI polling.
+
+    Called when a Developer moves to 'In Review' before CI has passed.
+    Instead of dispatching Reviewer, we redirect the ticket through
+    CI polling so it auto-advances when checks eventually pass.
+    """
+    ci_in_progress_state_id = _get_ci_in_progress_state_id(ticket_id)
+    if ci_in_progress_state_id is None:
+        logger.warning(
+            "Could not resolve 'CI in Progress' state id for %s — "
+            "CI polling will still run but state transition may fail.",
+            ticket_id,
+        )
+    else:
+        _move_linear_ticket_state(ticket_id, ci_in_progress_state_id)
+
+    # Register for server-side polling regardless of whether the state
+    # transition succeeded — we want to poll and log even if Linear fails.
+    start_ci_poll(
+        ticket_id=ticket_id,
+        pr_number=pr_number,
+        owner=owner,
+        repo=repo,
+        branch=branch or "",
+        in_progress_state_id=_get_in_progress_state_id(ticket_id),
+    )
+    logger.info(
+        "Redirected %s to CI polling (PR #%d, branch=%s) — "
+        "ticket will auto-advance to 'In Review' when CI passes.",
+        ticket_id, pr_number, branch,
+    )
+
+
+def _get_ci_in_progress_state_id(ticket_id: str) -> str | None:
+    """Resolve the Linear state id for 'CI in Progress'."""
+    query = """
+    query GetStates($id: String!) {
+      issue(id: $id) {
+        team {
+          states(filter: {names: ["CI in Progress", "CI in progress"]}) {
+            nodes { id name }
+          }
+        }
+      }
+    }
+    """
+    result = _linear_gql(query, {"id": ticket_id})
+    if not result:
+        return None
+    nodes = (result.get("issue") or {}).get("team", {}).get("states", {}).get("nodes") or []
+    for state in nodes:
+        name = (state.get("name") or "").strip()
+        if name.casefold() == "ci in progress":
+            return state["id"]
+    return None
 
 
 @app.on_event("startup")
@@ -901,6 +1000,36 @@ async def linear_webhook(request: Request):
                 state=new_state,
                 role=role,
             )
+
+    # ── CI Gate: Reviewer must not enter 'In Review' unless CI has passed ───
+    # If Developer moved to 'In Review' without waiting for CI, intercept here
+    # and redirect to 'CI in Progress' so the server-side poller can drive the
+    # ticket forward automatically when CI eventually passes.
+    if role == "Reviewer" and new_state == "In Review":
+        branch = _find_branch_for_ticket(ticket_id)
+        pr_info = _find_pr_by_branch(branch) if branch else {}
+        pr_number = pr_info.get("number") if pr_info else None
+        owner, repo = _resolve_repo_owner_repo(pr_info=pr_info if pr_info else None, data=data)
+        if pr_number:
+            ci = _get_ci_status_for_pr(owner, repo, pr_number)
+            if not ci.get("all_passed"):
+                logger.warning(
+                    "CI not passed for %s (PR #%d) — redirecting to 'CI in Progress' "
+                    "instead of dispatching Reviewer. CI state: %s",
+                    ticket_id, pr_number, ci,
+                )
+                _redirect_to_ci_in_progress(ticket_id, pr_number, owner, repo, branch, data)
+                return {
+                    "status": "ci_redirect",
+                    "ticket": ticket_id,
+                    "pr": pr_number,
+                    "reason": "CI not passed — intercepted before Reviewer dispatch",
+                }
+            else:
+                logger.info(
+                    "CI PASSED for %s (PR #%d) — proceeding with Reviewer dispatch.",
+                    ticket_id, pr_number,
+                )
 
     dedup_key = f"{ticket_id}:{role}:{state_key}"
     prompt = f"Ticket {ticket_id} has moved to '{new_state}'. Please perform your duties as {role}."
