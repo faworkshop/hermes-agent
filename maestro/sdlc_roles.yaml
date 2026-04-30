@@ -132,13 +132,14 @@ pipeline:
          are SUCCESS before you can claim the work is complete. Never move to 'In Review'
          until CI has actually passed.
          - Call github_get_pr_checks(repo, pr_number) to check CI status.
-         - If CI is still RUNNING: move the Linear ticket to 'CI in Progress' using
-           linear_update_status. The webhook server will poll GitHub and move the ticket
-           back to 'In Progress' automatically when CI passes. Do NOT loop waiting for CI.
-           linear_update_status MUST be your LAST action — exit immediately after.
-         - If CI is FAILED: fix the failing tests or code in this session. Push the fix,
-           re-check CI. Repeat until CI passes (or you hit an unrecoverable error).
+         - If CI is RUNNING: FIRST call linear_update_status to move the ticket to
+           'CI in Progress', THEN exit immediately. Do NOT wait, do NOT poll, do NOT
+           loop. The webhook server handles CI polling. linear_update_status MUST be
+           your LAST action.
+         - If CI is FAILED: fix the failing tests or code. Push the fix, re-check CI.
+           Repeat until CI passes. Only after CI is SUCCESS do you proceed to Step 7.
          - Only when BOTH test-frontend AND test-backend are SUCCESS may you proceed.
+           Do NOT enter any self-managed CI wait loop — always update Linear and exit.
       7. Once CI checks pass and the code is ready for review:
          a. Call github_update_pr(repo, pr_number, ready_for_review=True) to convert draft to OPEN.
          b. Move the Linear ticket to 'In Review' using linear_update_status.
@@ -146,7 +147,7 @@ pipeline:
     prompt: |
       Ticket {{ticket_id}} is 'In Progress'. Branch from `develop`, write the code and tests, verify they pass. Create a DRAFT PR with base `develop`, link it to Linear.
 
-      CI SUCCESS IS MANDATORY: Call github_get_pr_checks(repo, pr_number). Only when BOTH test-frontend AND test-backend are SUCCESS may you proceed. If CI is RUNNING: move ticket to 'CI in Progress' and exit immediately (webhook server polls CI). If CI is FAILED: fix and retry. When CI passes: convert draft to OPEN, move ticket to 'In Review'. linear_update_status MUST be your LAST action.
+      CI SUCCESS IS MANDATORY: Call github_get_pr_checks(repo, pr_number). If CI is RUNNING: call linear_update_status to move ticket to 'CI in Progress', then exit immediately. Do NOT wait, do NOT poll, do NOT loop — webhook server handles CI polling. If CI is FAILED: fix and retry. When CI passes: convert draft to OPEN, move ticket to 'In Review'. linear_update_status MUST be your LAST action — never exit without calling it first.
       If Jest/CI memory errors appear, follow the CI/Jest OOM RULE in the system instructions:
       isolate the hotspot with narrow targets, fix root cause in code/tests, then rerun CI-equivalent command to verify.
 
