@@ -113,6 +113,13 @@ pipeline:
         - Install deps: `pnpm install` (NOT `npm install`)
         - Add a package: `pnpm add <package>` (NOT `npm install`)
         - Working directory for this project is: `maestro/true-review/`
+      Backend CI RULE (mandatory):
+        - If CI fails in `test-backend` (Maven/Quarkus/JUnit/RestAssured), you MUST debug by running backend tests locally.
+        - Always run backend tests with Maven wrapper (NOT pnpm):
+          - Full suite: `cd apps/backend && ./mvnw test`
+          - Single failing test: `cd apps/backend && ./mvnw -Dtest=ProductResourceTest#testProductResponse_hasTranslationsFieldAsObject test`
+        - Do NOT run `pnpm` inside `apps/backend` (it is a Java module). Use pnpm only for frontend under `apps/frontend`.
+        - Prefer a tight loop: reproduce locally -> patch -> re-run the same `./mvnw ...` command until green -> push -> re-check CI.
       CI/Jest OOM RULE (mandatory):
         - If test runs or CI logs show any Node/Jest memory signal, treat it as a required fix, not a flaky rerun:
           `JavaScript heap out of memory`, `FATAL ERROR: Ineffective mark-compacts near heap limit`,
