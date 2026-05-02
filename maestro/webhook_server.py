@@ -188,6 +188,10 @@ def _normalize_linear_state_name(name: str) -> str:
     return " ".join((name or "").split()).casefold()
 
 
+# CI poller only touches GitHub / comments while the issue stays in this workflow state.
+CI_POLL_ALLOWED_STATE_KEY = _normalize_linear_state_name("CI in Progress")
+
+
 _STATE_AGENT_BY_NORMALIZED = {
     _normalize_linear_state_name(k): v for k, v in _STATE_AGENT_MAPPING_RAW.items()
 }
@@ -643,6 +647,9 @@ def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
 
 async def _ci_poll_worker() -> None:
     """Background worker: every CI_POLL_INTERVAL_SECONDS, check each pending ticket's CI status.
+
+    Runs GitHub checks and success/failure handling only while the Linear issue remains
+    in ``CI in Progress``; otherwise the ticket is dropped from the poll set.
     When all checks pass, move the ticket to 'In Progress'.
     When timeout is exceeded, remove the ticket from the polling set."""
     while not _worker_stop_event.is_set():
@@ -668,6 +675,22 @@ async def _ci_poll_worker() -> None:
                             ticket_id,
                             elapsed,
                         )
+                        continue
+
+                    linear_state = _get_issue_state_normalized_from_identifier(ticket_id)
+                    if linear_state is None:
+                        logger.warning(
+                            "CI poll %s: could not read Linear state — skipping this cycle",
+                            ticket_id,
+                        )
+                        continue
+                    if linear_state != CI_POLL_ALLOWED_STATE_KEY:
+                        logger.info(
+                            "CI poll %s: not in 'CI in Progress' (state=%r) — stopping poll",
+                            ticket_id,
+                            linear_state,
+                        )
+                        expired.append(ticket_id)
                         continue
 
                     ci = _get_ci_status_for_pr(owner, repo, pr_number)
@@ -903,6 +926,28 @@ def _move_linear_ticket_state(ticket_id: str, state_id: str) -> bool:
     else:
         logger.error("Failed to move ticket %s to state %s", ticket_id, state_id)
         return False
+
+
+def _get_issue_state_normalized_from_identifier(identifier: str) -> str | None:
+    """Current Linear workflow state name for a ticket identifier, normalized.
+
+    Returns None if the issue UUID cannot be resolved or Linear returns no state.
+    """
+    issue_uuid = _linear_issue_uuid_from_identifier(identifier)
+    if not issue_uuid:
+        return None
+    query = """
+    query IssueState($id: String!) {
+      issue(id: $id) {
+        state { name }
+      }
+    }
+    """
+    data = _linear_gql(query, {"id": issue_uuid})
+    name = ((data.get("issue") or {}).get("state") or {}).get("name")
+    if not name:
+        return None
+    return _normalize_linear_state_name(str(name))
 
 
 def _get_in_progress_state_id(ticket_id: str) -> str | None:
