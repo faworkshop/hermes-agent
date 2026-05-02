@@ -8,7 +8,15 @@ logger = logging.getLogger(__name__)
 
 class ConcurrencyManager:
     def __init__(self, db_path: str = "agent_state.db"):
-        self.db_path = db_path
+        if not (db_path or "").strip():
+            raise ValueError("ConcurrencyManager requires a non-empty db_path")
+        p = Path(db_path).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve(strict=False)
+        else:
+            p = p.resolve(strict=False)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = str(p)
         self._init_db()
 
     def _init_db(self):

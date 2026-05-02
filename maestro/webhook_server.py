@@ -58,8 +58,31 @@ if not logger.handlers:
     logger.addHandler(_file)
 
 app = FastAPI(title="Hermes Webhook Server")
-_DEFAULT_AGENT_DB_PATH = str((Path(__file__).resolve().parent.parent / "agent_state.db"))
-_AGENT_DB_PATH = os.getenv("HERMES_AGENT_STATE_DB", _DEFAULT_AGENT_DB_PATH)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_webhook_agent_db_path() -> str:
+    """Resolve agent queue SQLite path for this process.
+
+    Relative ``HERMES_AGENT_STATE_DB`` values are anchored to the **repository root**
+    (parent of ``maestro/``), not ``os.getcwd()``, so launchd/systemd/docker with a
+    surprising cwd still opens the same file as local development.
+
+    Ensures the parent directory exists so SQLite can create ``.db-wal`` / ``.db-shm``.
+    """
+    raw = (os.getenv("HERMES_AGENT_STATE_DB") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = _REPO_ROOT / p
+    else:
+        p = _REPO_ROOT / "agent_state.db"
+    p = p.resolve(strict=False)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
+
+_AGENT_DB_PATH = _resolve_webhook_agent_db_path()
 cm = ConcurrencyManager(db_path=_AGENT_DB_PATH)
 
 
