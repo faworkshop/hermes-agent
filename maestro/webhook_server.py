@@ -689,7 +689,7 @@ async def _ci_poll_worker() -> None:
                             f"✅ CI checks passed on branch `{ci.get('branch', 'unknown')}` — "
                             f"ticket moved to In Progress.",
                         )
-                        expired.append(tid)
+                        expired.append(ticket_id)
                     elif ci.get("all_passed") is False:
                         # CI failed — keep Developer on the ticket in In Progress.
                         # Do NOT add needs-human label — Developer can and should fix it.
@@ -735,7 +735,7 @@ async def _ci_poll_worker() -> None:
                                 "CI failure: active Developer task exists for %s — no new task enqueued",
                                 ticket_id,
                             )
-                        # Do NOT expired.append(tid) — keep polling
+                        # Do NOT expired.append(ticket_id) — keep polling
 
                 for tid in expired:
                     _ci_polling_tickets.pop(tid, None)
