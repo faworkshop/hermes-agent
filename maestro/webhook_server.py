@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import asyncio
+import sqlite3
 import time
 import uuid
 import requests
@@ -60,6 +61,62 @@ app = FastAPI(title="Hermes Webhook Server")
 _DEFAULT_AGENT_DB_PATH = str((Path(__file__).resolve().parent.parent / "agent_state.db"))
 _AGENT_DB_PATH = os.getenv("HERMES_AGENT_STATE_DB", _DEFAULT_AGENT_DB_PATH)
 cm = ConcurrencyManager(db_path=_AGENT_DB_PATH)
+
+
+def _resolved_agent_db_path() -> str:
+    """Absolute path used for logs and SQLite probes (matches operator expectations)."""
+    try:
+        return str(Path(cm.db_path).expanduser().resolve())
+    except Exception:
+        return str(Path(cm.db_path).expanduser())
+
+
+def _log_agent_state_db_at_startup() -> None:
+    """Log queue DB path, directory permissions, and a trivial SQLite probe."""
+    resolved = _resolved_agent_db_path()
+    parent = Path(resolved).parent
+    logger.info(
+        "Agent queue DB: raw=%r resolved=%r env.HERMES_AGENT_STATE_DB=%r",
+        cm.db_path,
+        resolved,
+        os.getenv("HERMES_AGENT_STATE_DB"),
+    )
+    logger.info(
+        "Agent queue DB parent: %r is_dir=%s access[RWX]=%s/%s/%s",
+        str(parent),
+        parent.is_dir(),
+        os.access(parent, os.R_OK),
+        os.access(parent, os.W_OK),
+        os.access(parent, os.X_OK),
+    )
+    try:
+        with sqlite3.connect(resolved, timeout=5.0, isolation_level=None) as conn:
+            conn.execute("SELECT 1").fetchone()
+        logger.info("Agent queue DB probe: sqlite connect + SELECT 1 OK")
+    except sqlite3.Error as exc:
+        logger.error(
+            "Agent queue DB probe FAILED (queue workers will fail until fixed): %s",
+            exc,
+            exc_info=True,
+        )
+
+
+def _sqlite_queue_error_note(exc: BaseException) -> str:
+    """Extra context for sqlite3.OperationalError (e.g. unable to open database file)."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return ""
+    try:
+        resolved = _resolved_agent_db_path()
+    except Exception:
+        resolved = cm.db_path
+    return (
+        " SQLite_context"
+        f" path={cm.db_path!r} resolved={resolved!r}"
+        f" HERMES_AGENT_STATE_DB={os.getenv('HERMES_AGENT_STATE_DB')!r}"
+        f" cwd={os.getcwd()!r}"
+    )
+
+
 _worker_tasks: dict[str, asyncio.Task] = {}
 _ci_poll_task: asyncio.Task | None = None
 _pm_scanner_task: asyncio.Task | None = None
@@ -464,10 +521,12 @@ async def _agent_worker(role: str) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            note = _sqlite_queue_error_note(exc)
             logger.error(
-                "Queue worker loop error for role=%s: %s. Backing off and continuing.",
+                "Queue worker loop error for role=%s: %s.%s Backing off and continuing.",
                 role,
                 exc,
+                note,
                 exc_info=True,
             )
             await asyncio.sleep(1.5)
@@ -683,7 +742,8 @@ async def _ci_poll_worker() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("CI poll worker loop error: %s", exc, exc_info=True)
+            note = _sqlite_queue_error_note(exc)
+            logger.error("CI poll worker loop error: %s%s", exc, note, exc_info=True)
             await asyncio.sleep(2.0)
 
 
@@ -751,7 +811,8 @@ async def _pm_intake_scanner_worker() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("PM intake scanner loop error: %s", exc, exc_info=True)
+            note = _sqlite_queue_error_note(exc)
+            logger.error("PM intake scanner loop error: %s%s", exc, note, exc_info=True)
             await asyncio.sleep(2.0)
 
 
@@ -953,6 +1014,7 @@ def _get_ci_in_progress_state_id(ticket_id: str) -> str | None:
 @app.on_event("startup")
 async def _startup_workers() -> None:
     global _ci_poll_task, _pm_scanner_task
+    _log_agent_state_db_at_startup()
     _worker_stop_event.clear()
     for role in _queue_roles():
         if role in _worker_tasks and not _worker_tasks[role].done():
