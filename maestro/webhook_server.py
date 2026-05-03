@@ -749,12 +749,15 @@ async def _ci_poll_worker() -> None:
                             "CI FAILED for %s — Developer stays on ticket, keeping poll active",
                             ticket_id,
                         )
-                        _post_linear_comment(
-                            ticket_id,
-                            f"❌ CI failed on branch `{ci.get('branch', 'unknown')}`: "
-                            f"{', '.join(failed_names)}. "
-                            f"Developer will fix and re-push.",
-                        )
+                        # Only post the failure comment once — not every poll cycle.
+                        if not info.get("failure_comment_posted"):
+                            _post_linear_comment(
+                                ticket_id,
+                                f"❌ CI failed on branch `{ci.get('branch', 'unknown')}`: "
+                                f"{', '.join(failed_names)}. "
+                                f"Developer will fix and re-push.",
+                            )
+                            info["failure_comment_posted"] = True
                         # Re-dispatch Developer so they are immediately notified and can act.
                         # Dedup key matches the webhook-triggered Developer dispatch so a new
                         # task is only created if no active Developer task exists.
@@ -1009,6 +1012,7 @@ def start_ci_poll(ticket_id: str, pr_number: int, owner: str, repo: str, branch:
         "branch": branch,
         "added_at": time.time(),
         "in_progress_state_id": in_progress_state_id,
+        "failure_comment_posted": False,
     }
     logger.info("Started CI polling for %s (PR #%d, branch=%s, in_progress_state_id=%s)",
                 ticket_id, pr_number, branch, in_progress_state_id)
