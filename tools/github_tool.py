@@ -283,7 +283,7 @@ registry.register(
     toolset="github",
     schema={
         "name": "github_read_diff",
-        "description": "Read the diff of a PR to analyze changes.",
+        "description": "Read the diff of a PR to analyze changes. Returns the full diff as plain text.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -296,6 +296,7 @@ registry.register(
     handler=lambda args, **kw: github_read_diff(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
+    max_result_size_chars=float("inf"),
 )
 
 registry.register(
@@ -424,6 +425,7 @@ registry.register(
     handler=lambda args, **kw: github_get_pr(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
+    max_result_size_chars=float("inf"),
 )
 
 registry.register(
@@ -465,6 +467,7 @@ registry.register(
     handler=lambda args, **kw: github_get_pr_checks(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
+    max_result_size_chars=float("inf"),
 )
 
 registry.register(
