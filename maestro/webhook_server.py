@@ -1387,6 +1387,45 @@ async def recover_stale_queue_tasks(
     }
 
 
+@app.post("/ci-poll/restart")
+async def restart_ci_poll(request: Request):
+    """Re-add a ticket to CI polling. Useful after server restart.
+
+    Body (JSON):
+        ticket_id: Linear ticket identifier, e.g. "FAW-42"
+        pr_number: Optional PR number. If not provided, searches GitHub.
+
+    Returns:
+        {"status": "ok", "ticket": ticket_id, "pr": pr_number}
+    """
+    try:
+        body = await request.body()
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    ticket_id = (payload.get("ticket_id") or "").strip()
+    pr_number = payload.get("pr_number")
+
+    if not ticket_id:
+        raise HTTPException(status_code=400, detail="ticket_id is required")
+
+    branch = _find_branch_for_ticket(ticket_id)
+    if not branch:
+        return {"status": "error", "detail": f"Could not find branch for {ticket_id}"}
+
+    if not pr_number:
+        pr_info = _find_pr_by_branch(branch)
+        pr_number = pr_info.get("number") if pr_info else None
+
+    if not pr_number:
+        return {"status": "error", "detail": f"Could not find PR for branch {branch}"}
+
+    owner, repo = _resolve_repo_owner_repo(pr_info={"number": pr_number}, data={})
+    start_ci_poll(ticket_id, pr_number, owner, repo, branch)
+    return {"status": "ok", "ticket": ticket_id, "pr": pr_number, "branch": branch}
+
+
 @app.post("/trigger-agent")
 async def trigger_agent(
     request: Request,
