@@ -202,9 +202,9 @@ _STATE_AGENT_MAPPING_RAW: Dict[str, str] = {
     "In Review": "Reviewer",
     "Ready For QA": "QA",
 }
-# Intentionally unmapped (no agent webhook): Ready For Delivery, Approved For Delivery, Done —
-# see sdlc_roles.yaml / common_system. QA ends automation at Ready For Delivery; humans advance
-# Approved For Delivery and Done (production).
+# Intentionally unmapped (no agent webhook): Blocked, Ready For Delivery, Approved For Delivery, Done —
+# see sdlc_roles.yaml / common_system. Blocked is used when the queue marks a run failed; humans
+# unblock. QA ends automation at Ready For Delivery; humans advance Approved For Delivery and Done.
 
 
 def _normalize_linear_state_name(name: str) -> str:
@@ -594,12 +594,32 @@ async def _agent_worker(role: str) -> None:
                 else:
                     err = run_result.terminal_error_for_sqlite() or "Agent run failed"
                     cm.complete_task(task_id, success=False, error=err)
+                    try:
+                        _notify_linear_agent_blocked_on_queue_failure(
+                            ticket_id, role, err, task_id=task_id
+                        )
+                    except Exception as notify_exc:
+                        logger.error(
+                            "After queue failure, Linear Blocked notify failed: %s",
+                            notify_exc,
+                            exc_info=True,
+                        )
             except Exception as exc:
                 logger.error("Worker %s failed task %s: %s", role, task_id, exc, exc_info=True)
                 msg = str(exc).strip()
                 if len(msg) > _MAX_TASK_LAST_ERROR_LEN:
                     msg = msg[:_MAX_TASK_LAST_ERROR_LEN] + "…(truncated)"
                 cm.complete_task(task_id, success=False, error=msg or type(exc).__name__)
+                try:
+                    _notify_linear_agent_blocked_on_queue_failure(
+                        ticket_id, role, msg or type(exc).__name__, task_id=task_id
+                    )
+                except Exception as notify_exc:
+                    logger.error(
+                        "After queue failure, Linear Blocked notify failed: %s",
+                        notify_exc,
+                        exc_info=True,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -920,18 +940,139 @@ async def _pm_intake_scanner_worker() -> None:
             await asyncio.sleep(2.0)
 
 
+def _linear_issue_graphql_id(ticket_ref: str) -> str | None:
+    """Resolve ``FAW-123``-style identifiers to Linear issue UUID; pass UUIDs through unchanged."""
+    s = (ticket_ref or "").strip()
+    if not s:
+        return None
+    if re.match(r"^[A-Za-z0-9]+-\d+$", s):
+        return _linear_issue_uuid_from_identifier(s) or None
+    return s
+
+
+def _get_team_workflow_state_id_by_normalized_name(
+    issue_uuid: str, normalized_name: str
+) -> str | None:
+    """Return workflow state id on the issue's team whose name normalizes to ``normalized_name``."""
+    query = """
+    query IssueTeamStates($id: String!) {
+      issue(id: $id) {
+        team {
+          states {
+            nodes { id name }
+          }
+        }
+      }
+    }
+    """
+    data = _linear_gql(query, {"id": issue_uuid})
+    nodes = (data.get("issue") or {}).get("team", {}).get("states", {}).get("nodes") or []
+    for state in nodes:
+        if _normalize_linear_state_name(state.get("name") or "") == normalized_name:
+            sid = (state.get("id") or "").strip()
+            return sid or None
+    return None
+
+
+def _notify_linear_agent_blocked_on_queue_failure(
+    ticket_identifier: str,
+    role: str,
+    error_text: str,
+    *,
+    task_id: int | None = None,
+) -> None:
+    """On terminal queue failure: label ``needs-human``, move to **Blocked** when available, post comment.
+
+    Skipped when ``MAESTRO_SKIP_LINEAR_FAILURE_NOTIFY`` is truthy or ``LINEAR_API_KEY`` is missing.
+    """
+    skip = os.getenv("MAESTRO_SKIP_LINEAR_FAILURE_NOTIFY", "").strip().lower()
+    if skip in {"1", "true", "yes", "on"}:
+        logger.info("Skipping Linear Blocked notify (MAESTRO_SKIP_LINEAR_FAILURE_NOTIFY set)")
+        return
+    if not LINEAR_API_KEY:
+        logger.warning("Skipping Linear Blocked notify: no LINEAR_API_KEY")
+        return
+
+    issue_uuid = _linear_issue_graphql_id(ticket_identifier)
+    if not issue_uuid:
+        logger.warning("Skipping Linear Blocked notify: cannot resolve issue id for %r", ticket_identifier)
+        return
+
+    blocked_key = _normalize_linear_state_name("Blocked")
+    current = _get_issue_state_normalized_from_identifier(ticket_identifier)
+
+    err_trim = (error_text or "").strip()
+    if len(err_trim) > 3500:
+        err_trim = err_trim[:3500] + "\n…(truncated)"
+
+    task_note = f" (queue task #{task_id})" if task_id is not None else ""
+    blocked_sid: str | None = None
+    if current != blocked_key:
+        blocked_sid = _get_team_workflow_state_id_by_normalized_name(issue_uuid, blocked_key)
+        if not blocked_sid:
+            logger.warning(
+                "No Linear workflow state named 'Blocked' for ticket %s — skipping state move",
+                ticket_identifier,
+            )
+
+    try:
+        moved = False
+        if current != blocked_key and blocked_sid:
+            moved = bool(_move_linear_ticket_state(issue_uuid, blocked_sid))
+
+        if not _add_linear_label(issue_uuid, "needs-human"):
+            logger.warning("needs-human label may not have applied for %s", ticket_identifier)
+
+        if current == blocked_key:
+            move_note = "Already in **Blocked**; no state change."
+        elif moved:
+            move_note = "Moved to **Blocked**."
+        elif blocked_sid:
+            move_note = (
+                "Could not move to **Blocked** (Linear state update failed); "
+                "left in current workflow state."
+            )
+        else:
+            move_note = (
+                "No **Blocked** state on this team workflow; left in current workflow state."
+            )
+        body = (
+            f"## Queue run failed — needs human\n\n"
+            f"**Agent:** `{role}`{task_note}\n\n"
+            f"{move_note}\n\n"
+            f"**Error:**\n```\n{err_trim}\n```\n\n"
+            f"Labeled **needs-human** for triage."
+        )
+        _post_linear_comment(issue_uuid, body)
+        logger.info(
+            "Linear Blocked notify for %s role=%s moved=%s",
+            ticket_identifier,
+            role,
+            moved,
+        )
+    except Exception as exc:
+        logger.error(
+            "Linear Blocked notify failed for %s: %s",
+            ticket_identifier,
+            exc,
+            exc_info=True,
+        )
+
+
 def _post_linear_comment(ticket_id: str, body: str) -> None:
     """Post a comment to a Linear issue."""
+    issue_id = _linear_issue_graphql_id(ticket_id) or ticket_id.strip()
     mutation = """
     mutation CommentCreate($input: CommentCreateInput!) {
       commentCreate(input: $input) { success comment { id } }
     }
     """
-    _linear_gql(mutation, {"input": {"issueId": ticket_id, "body": body}})
+    _linear_gql(mutation, {"input": {"issueId": issue_id, "body": body}})
 
 
 def _add_linear_label(ticket_id: str, label_name: str) -> bool:
     """Add a label to a Linear issue by name. Creates the label if it doesn't exist."""
+    issue_graph_id = _linear_issue_graphql_id(ticket_id) or ticket_id.strip()
     # First try to find the label ID by name
     query = """
     query Organization($teamId: String!) {
@@ -947,7 +1088,7 @@ def _add_linear_label(ticket_id: str, label_name: str) -> bool:
       issue(id: $id) { team { id } }
     }
     """
-    issue_result = _linear_gql(issue_query, {"id": ticket_id})
+    issue_result = _linear_gql(issue_query, {"id": issue_graph_id})
     if not issue_result:
         return False
     team_id = issue_result.get("issue", {}).get("team", {}).get("id")
@@ -987,7 +1128,7 @@ def _add_linear_label(ticket_id: str, label_name: str) -> bool:
       issueAddLabel(id: $id, labelId: $labelId) { success }
     }
     """
-    result = _linear_gql(add_mutation, {"id": ticket_id, "labelId": label_id})
+    result = _linear_gql(add_mutation, {"id": issue_graph_id, "labelId": label_id})
     if result:
         logger.info("Added label '%s' to ticket %s", label_name, ticket_id)
     return bool(result)
@@ -995,12 +1136,13 @@ def _add_linear_label(ticket_id: str, label_name: str) -> bool:
 
 def _move_linear_ticket_state(ticket_id: str, state_id: str) -> bool:
     """Move a Linear issue to a specific state by state ID."""
+    issue_graph_id = _linear_issue_graphql_id(ticket_id) or ticket_id.strip()
     mutation = """
     mutation UpdateState($id: String!, $stateId: String!) {
       issueUpdate(id: $id, input: {stateId: $stateId}) { success }
     }
     """
-    result = _linear_gql(mutation, {"id": ticket_id, "stateId": state_id})
+    result = _linear_gql(mutation, {"id": issue_graph_id, "stateId": state_id})
     if result:
         logger.info("Moved ticket %s to state %s", ticket_id, state_id)
         return True

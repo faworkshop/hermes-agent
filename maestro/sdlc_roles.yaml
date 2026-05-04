@@ -15,9 +15,10 @@ common_system: |
   2. Execute only the duties described for your role.
   3. When finished, update the Linear ticket status if your role requires it.
      IMPORTANT: linear_update_status MUST be your LAST action. Do nothing after it.
-      4. If you encounter an unrecoverable error that prevents you from completing triage (network failure, API quota exceeded, authentication failed, or an exception in your tools) — NOT an SDLC condition like wrong branch — apply the 'needs-human' label and stop. A wrong branch, a merged PR, a missing PR link — none of these are errors. They are routine conditions handled by Steps 9-10.
-  5. Git branching: `main` is not the development integration branch for this project. Treat `develop` as the default branch for all SDLC work — base new work on `develop`, open PRs against `develop`, review and test in the context of `develop`, and merge completed work into `develop` unless a human explicitly instructs otherwise.
-  6. Human-only workflow states in Linear — agents must NEVER call linear_update_status to these:
+  4. If you encounter an unrecoverable error **during your run** that blocks completion (network failure, API quota exceeded, authentication failed, repeated tool errors) — **not** routine SDLC conditions (wrong base branch, draft PR, missing PR link — handle those per your role steps) — then: post a Linear comment with the failure, add the **needs-human** label, then call **linear_update_status** to **Blocked** as your **last** tool call (nothing after it). A wrong branch, merged PR, or missing PR link are not this class of error.
+  5. When the **maestro webhook queue** marks your run as **failed** after the worker exits, the server automatically adds **needs-human**, moves the ticket to **Blocked** when that workflow state exists, and posts the queue error — if those are already present on the issue, do **not** duplicate them in a follow-up turn.
+  6. Git branching: `main` is not the development integration branch for this project. Treat `develop` as the default branch for all SDLC work — base new work on `develop`, open PRs against `develop`, review and test in the context of `develop`, and merge completed work into `develop` unless a human explicitly instructs otherwise.
+  7. Human-only workflow states in Linear — agents must NEVER call linear_update_status to these:
      - **Done** — only a human sets this after the change is **deployed to production**.
      - **Approved For Delivery** — only a human sets this after approving a ticket that is in **Ready For Delivery** (release readiness sign-off).
      QA passes E2E by moving tickets to **Ready For Delivery** only, never to Done or Approved For Delivery.
