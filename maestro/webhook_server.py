@@ -15,8 +15,9 @@ from dotenv import load_dotenv
 # Load GITHUB_TOKEN and other env vars from ~/.hermes/.env
 load_dotenv(Path.home() / ".hermes" / ".env")
 
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Request, HTTPException, Query
 
@@ -403,15 +404,40 @@ def verify_linear_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(computed_signature, signature)
 
 
+_MAX_TASK_LAST_ERROR_LEN = 4000
+
+
+@dataclass(frozen=True)
+class AgentTaskRunResult:
+    """Outcome of ``run_agent_task`` for ``complete_task`` / requeue bookkeeping."""
+
+    outcome: str  # success | failed | requeued_after_timeout
+    error: Optional[str] = None
+
+    def terminal_error_for_sqlite(self) -> Optional[str]:
+        """Error string to persist on ``agent_tasks.last_error`` (failed runs only)."""
+        if self.outcome == "success":
+            return None
+        if self.error:
+            msg = self.error.strip()
+            if len(msg) > _MAX_TASK_LAST_ERROR_LEN:
+                return msg[:_MAX_TASK_LAST_ERROR_LEN] + "…(truncated)"
+            return msg
+        return "Agent run failed"
+
+
 async def run_agent_task(
     role: str, ticket_id: str, prompt: str, session_id: str = None,
     hard_timeout_seconds: float = None,
-) -> bool:
+) -> AgentTaskRunResult:
     if role in ["Developer", "Reviewer", "QA"]:
         retries = cm.get_retry_count(ticket_id)
         if retries >= 3:
             logger.error(f"Circuit Breaker Tripped for {ticket_id}. Max retries reached.")
-            return False
+            return AgentTaskRunResult(
+                "failed",
+                f"Circuit breaker: ticket {ticket_id} has retry count >= 3 ({retries})",
+            )
 
     logger.info(f"Starting {role} Agent for {ticket_id} (timeout=%ss)", hard_timeout_seconds)
 
@@ -471,18 +497,33 @@ async def run_agent_task(
                     cm.requeue_task(
                         active_task["id"],
                         delay_seconds=30.0,
-                        error=f"Hard timeout after {hard_timeout_seconds}s — agent exceeded allowed runtime",
+                        error=(
+                            f"Hard timeout after {hard_timeout_seconds}s — "
+                            "agent exceeded allowed runtime (task requeued)"
+                        ),
                     )
-                return False
+                    # Caller must NOT call complete_task — row is already ``queued`` again.
+                    return AgentTaskRunResult("requeued_after_timeout")
+                logger.error(
+                    "Hard timeout for %s/%s but no active task row to requeue",
+                    role,
+                    ticket_id,
+                )
+                return AgentTaskRunResult(
+                    "failed",
+                    f"Hard timeout after {hard_timeout_seconds}s (requeue skipped: no active task row)",
+                )
+        else:
+            await future
     except asyncio.CancelledError:
         logger.warning("Agent task cancelled for %s/%s", role, ticket_id)
         raise
     except Exception as e:
         logger.error(f"Error running {role} Agent for {ticket_id}: {e}")
-        return False
+        return AgentTaskRunResult("failed", f"{type(e).__name__}: {e}")
     finally:
         cm.release_lock(ticket_id, role)
-    return True
+    return AgentTaskRunResult("success")
 
 
 def _queue_roles() -> list[str]:
@@ -537,14 +578,28 @@ async def _agent_worker(role: str) -> None:
                 continue
 
             try:
-                ok = await run_agent_task(
+                run_result = await run_agent_task(
                     role, ticket_id, prompt, session_id=session_id,
                     hard_timeout_seconds=_STALE_RUNNING_SECONDS,
                 )
-                cm.complete_task(task_id, success=ok, error=None if ok else "Agent run failed")
+                if run_result.outcome == "requeued_after_timeout":
+                    logger.info(
+                        "Task %s (%s/%s) requeued after hard timeout — skipping complete_task",
+                        task_id,
+                        role,
+                        ticket_id,
+                    )
+                elif run_result.outcome == "success":
+                    cm.complete_task(task_id, success=True, error=None)
+                else:
+                    err = run_result.terminal_error_for_sqlite() or "Agent run failed"
+                    cm.complete_task(task_id, success=False, error=err)
             except Exception as exc:
                 logger.error("Worker %s failed task %s: %s", role, task_id, exc, exc_info=True)
-                cm.complete_task(task_id, success=False, error=str(exc))
+                msg = str(exc).strip()
+                if len(msg) > _MAX_TASK_LAST_ERROR_LEN:
+                    msg = msg[:_MAX_TASK_LAST_ERROR_LEN] + "…(truncated)"
+                cm.complete_task(task_id, success=False, error=msg or type(exc).__name__)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
