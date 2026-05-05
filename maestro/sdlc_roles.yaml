@@ -115,12 +115,16 @@ pipeline:
         - Add a package: `pnpm add <package>` (NOT `npm install`)
         - Working directory for this project is: `maestro/true-review/`
       Backend CI RULE (mandatory):
-        - If CI fails in `test-backend` (Maven/Quarkus/JUnit/RestAssured), you MUST debug by running backend tests locally.
-        - Always run backend tests with Maven wrapper (NOT pnpm):
+        - `cd apps/backend && ./mvnw test` is the SOLE gate for backend code. `./mvnw compile`
+          is NOT sufficient — Quarkus CDI bootstrap errors only appear during `test`.
+          ALWAYS run `./mvnw test` before any git push, no exceptions.
+        - Run backend tests with Maven wrapper (NOT pnpm):
           - Full suite: `cd apps/backend && ./mvnw test`
-          - Single failing test: `cd apps/backend && ./mvnw -Dtest=ProductResourceTest#testProductResponse_hasTranslationsFieldAsObject test`
-        - Do NOT run `pnpm` inside `apps/backend` (it is a Java module). Use pnpm only for frontend under `apps/frontend`.
-        - Prefer a tight loop: reproduce locally -> patch -> re-run the same `./mvnw ...` command until green -> push -> re-check CI.
+          - Single failing test: `cd apps/backend && ./mvnw -Dtest=ClassName#methodName test`
+        - Do NOT run `pnpm` inside `apps/backend` (it is a Java module). Use pnpm only for frontend.
+        - Frontend: `cd apps/frontend && pnpm run lint && pnpm run type-check && pnpm run test:ci`
+        - NEVER push with failing or unverified tests. The sequence is always:
+          write code → run tests locally → all pass → git push → verify CI.
       CI/Jest OOM RULE (mandatory):
         - If test runs or CI logs show any Node/Jest memory signal, treat it as a required fix, not a flaky rerun:
           `JavaScript heap out of memory`, `FATAL ERROR: Ineffective mark-compacts near heap limit`,
@@ -146,12 +150,18 @@ pipeline:
       6. CI success is a MANDATORY gate — you MUST verify both test-frontend and test-backend
          are SUCCESS before you can claim the work is complete. Never move to 'In Review'
          until CI has actually passed.
+         PRE-PUSH TEST RULE (mandatory, applies to EVERY push — including fix pushes):
+           Before any `git push`, you MUST run the full local test suite:
+             - Backend: `cd apps/backend && ./mvnw test`
+             - Frontend: `cd apps/frontend && pnpm run lint && pnpm run type-check && pnpm run test:ci`
+           git push is ONLY permitted after these commands pass. Do NOT skip this step.
          - Call github_get_pr_checks(repo, pr_number) to check CI status.
          - If CI is RUNNING: FIRST call linear_update_status to move the ticket to
            'CI in Progress', THEN exit immediately. Do NOT wait, do NOT poll, do NOT
            loop. The webhook server handles CI polling. linear_update_status MUST be
            your LAST action.
-         - If CI is FAILED: fix the failing tests or code. Push the fix, re-check CI.
+         - If CI is FAILED: fix the failing tests or code locally (run `./mvnw test` after
+           each fix), push only after tests pass locally, then re-check CI.
            Repeat until CI passes. Only after CI is SUCCESS do you proceed to Step 7.
          - Only when BOTH test-frontend AND test-backend are SUCCESS may you proceed.
            Do NOT enter any self-managed CI wait loop — always update Linear and exit.
