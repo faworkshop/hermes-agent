@@ -170,23 +170,42 @@ pipeline:
          b. Move the Linear ticket to 'In Review' using linear_update_status.
             CRITICAL: linear_update_status MUST be your LAST action. Do NOT post any comments, add any labels, or take any action after calling it.
     prompt: |
-      Ticket {{ticket_id}} is 'In Progress'. Branch from `develop`, write the code and tests, verify they pass. Create a DRAFT PR with base `develop`, link it to Linear.
+      Ticket {{ticket_id}} is 'In Progress'. Your job: get CI green and move the ticket to 'In Review'.
 
-      CI SUCCESS IS MANDATORY: Call github_get_pr_checks(repo, pr_number). If CI is RUNNING: call linear_update_status to move ticket to 'CI in Progress', then exit immediately. Do NOT wait, do NOT poll, do NOT loop — webhook server handles CI polling. If CI is FAILED: fix and retry. When CI passes: convert draft to OPEN, move ticket to 'In Review'. linear_update_status MUST be your LAST action — never exit without calling it first.
-      If Jest/CI memory errors appear, follow the CI/Jest OOM RULE in the system instructions:
-      isolate the hotspot with narrow targets, fix root cause in code/tests, then rerun CI-equivalent command to verify.
+      STEP 0 — Check existing branches FIRST (do this before creating anything):
+        Run: `git fetch origin && git branch -r | grep {{ticket_id}}`
+        If a remote feature/bugfix branch for this ticket already exists:
+          - Checkout that branch: `git checkout origin/feature/{{ticket_id}}` or similar
+          - Reset to it: `git reset --hard origin/feature/{{ticket_id}}`
+          - DO NOT create a new branch — reuse the existing one
+        Only create a new branch if no existing branch is found.
+
+      STEP 1 — Read the Linear ticket and any QA/Reviewer failure comments:
+        Call linear_read_ticket(ticket_id="{{ticket_id}}") and linear_read_comments(ticket_id="{{ticket_id}}")
+        If prior agents posted failure details (e.g. "test-backend failure: ..."), fix THOSE specific
+        issues FIRST before doing anything else.
+
+      STEP 2 — Backend CI rule (mandatory):
+        `cd apps/backend && ./mvnw test` is the SOLE gate for backend code. `./mvnw compile` is NOT sufficient.
+        Run tests locally BEFORE pushing. git push is ONLY permitted after `./mvnw test` passes.
+
+      STEP 3 — Frontend: `cd apps/frontend && pnpm run lint && pnpm run type-check && pnpm run test:ci`
+
+      STEP 4 — Push and verify CI:
+        Call github_get_pr_checks(repo="faworkshop/true-review", pr_number=<the PR number>).
+        If CI is RUNNING: call linear_update_status to move ticket to 'CI in Progress', then exit
+        immediately. The webhook server handles CI polling — do NOT loop or wait.
+        If CI is FAILED: fix the specific failing tests, re-run locally, push only after local tests pass.
+        When CI is SUCCESS: call github_update_pr(repo, pr_number, ready_for_review=True), then
+        call linear_update_status to move ticket to 'In Review'. linear_update_status MUST be your
+        LAST action — never exit without calling it.
 
       IMPORTANT — mandatory exit rule:
-      You MUST call linear_update_status to move the ticket before exiting.
-      Never return/exit without updating Linear — doing so leaves the ticket stuck.
-      - If both CI checks are SUCCESS and the PR is ready: move to 'In Review'.
-      - If CI is still running: move to 'CI in Progress'. The webhook server will
-        poll GitHub CI and move the ticket back to 'In Progress' automatically when
-        CI passes. Do NOT loop polling CI yourself.
-      - If CI is failing and you cannot fix it in the remaining iterations: move to
-        'In Progress' with a comment describing the failure so the next Developer
-        run can investigate.
-      linear_update_status MUST be your LAST action. Do NOT do anything after it.
+        - CI SUCCESS and PR ready → move to 'In Review'
+        - CI still running → move to 'CI in Progress', then exit (webhook server polls for you)
+        - CI failing and cannot fix in this session → move to 'In Progress' with a comment describing
+          the failure so the next Developer run can continue
+        linear_update_status MUST be your LAST action. Do NOT do anything after it.
 
   - agent_key: Reviewer
     toolsets:
