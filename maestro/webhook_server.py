@@ -411,7 +411,7 @@ _MAX_TASK_LAST_ERROR_LEN = 4000
 class AgentTaskRunResult:
     """Outcome of ``run_agent_task`` for ``complete_task`` / requeue bookkeeping."""
 
-    outcome: str  # success | failed | requeued_after_timeout
+    outcome: str  # success | failed | requeued_after_timeout | ci_redirect
     error: Optional[str] = None
 
     def terminal_error_for_sqlite(self) -> Optional[str]:
@@ -589,6 +589,16 @@ async def _agent_worker(role: str) -> None:
                         role,
                         ticket_id,
                     )
+                elif run_result.outcome == "ci_redirect":
+                    # CI gate intercepted the dispatch before the agent ran.
+                    # Complete as success — the task correctly redirected to CI polling.
+                    logger.info(
+                        "Task %s (%s/%s) ci_redirect — completing task (CI polling now drives ticket)",
+                        task_id,
+                        role,
+                        ticket_id,
+                    )
+                    cm.complete_task(task_id, success=True, error=None)
                 elif run_result.outcome == "success":
                     cm.complete_task(task_id, success=True, error=None)
                 else:
@@ -800,7 +810,7 @@ async def _ci_poll_worker() -> None:
                         elapsed,
                     )
 
-                    if ci.get("all_passed"):
+                    if ci.get("all_passed") is True:
                         state_id = info.get("in_progress_state_id")
                         if state_id:
                             _move_linear_ticket_state(ticket_id, state_id)
@@ -812,54 +822,54 @@ async def _ci_poll_worker() -> None:
                         )
                         expired.append(ticket_id)
                     elif ci.get("all_passed") is False:
-                        # CI failed — keep Developer on the ticket in In Progress.
-                        # Do NOT add needs-human label — Developer can and should fix it.
-                        # Keep polling: when Developer pushes a fix, CI will eventually pass.
-                        # Re-dispatch Developer with CI failure details so they know what to fix.
+                        # CI failed — move ticket back to In Progress and enqueue
+                        # Developer for follow-up. Keep polling so we catch the
+                        # re-run when Developer pushes a fix; don't expire yet.
                         failed_names = [
                             r["name"] for r in ci.get("runs", [])
                             if r.get("conclusion") == "failure"
                         ]
                         logger.warning(
-                            "CI FAILED for %s — Developer stays on ticket, keeping poll active",
+                            "CI FAILED for %s — moving back to In Progress, enqueuing Developer",
                             ticket_id,
                         )
-                        # Only post the failure comment once — not every poll cycle.
-                        if not info.get("failure_comment_posted"):
-                            _post_linear_comment(
-                                ticket_id,
-                                f"❌ CI failed on branch `{ci.get('branch', 'unknown')}`: "
-                                f"{', '.join(failed_names)}. "
-                                f"Developer will fix and re-push.",
-                            )
-                            info["failure_comment_posted"] = True
-                        # Re-dispatch Developer so they are immediately notified and can act.
-                        # Dedup key matches the webhook-triggered Developer dispatch so a new
-                        # task is only created if no active Developer task exists.
-                        dev_dedup_key = f"{ticket_id}:Developer:in progress"
-                        dev_prompt = (
-                            f"CI failed on branch `{ci.get('branch', 'unknown')}`: "
+                        state_id = info.get("in_progress_state_id")
+                        if state_id:
+                            _move_linear_ticket_state(ticket_id, state_id)
+                        _post_linear_comment(
+                            ticket_id,
+                            f"❌ CI failed on branch `{ci.get('branch', 'unknown')}`: "
                             f"{', '.join(failed_names)}. "
-                            f"Please fix the failures and push a new commit to re-trigger CI."
+                            f"Ticket moved to In Progress — Developer will claim and fix.",
+                        )
+                        # Always enqueue Developer for follow-up, even if the Linear
+                        # move failed (ticket may already be in In Progress from a
+                        # concurrent webhook or manual action).
+                        dedup_key = f"{ticket_id}:Developer:in progress"
+                        prompt = (
+                            f"CI failed for Ticket {ticket_id} on branch `{ci.get('branch', 'unknown')}`: "
+                            f"{', '.join(failed_names)}. "
+                            f"Please fix the failing tests/checks and push a new commit."
                         )
                         created, _ = cm.enqueue_task(
                             ticket_id,
                             "Developer",
-                            dev_prompt,
-                            dedup_key=dev_dedup_key,
+                            prompt,
+                            dedup_key=dedup_key,
                             source_state="in progress",
                         )
                         if created:
                             logger.info(
-                                "CI failure re-dispatched Developer for %s (task enqueued)",
+                                "CI failure enqueued Developer for %s (new commit will trigger fresh CI)",
                                 ticket_id,
                             )
                         else:
                             logger.info(
-                                "CI failure: active Developer task exists for %s — no new task enqueued",
+                                "CI failure %s: Developer already queued/running — will follow up on next cycle",
                                 ticket_id,
                             )
-                        # Do NOT expired.append(ticket_id) — keep polling
+                        # Do NOT expire — keep polling so we catch CI re-run after Developer pushes.
+                        # The ticket stays in CI in Progress in Linear while Developer works.
 
                 for tid in expired:
                     _ci_polling_tickets.pop(tid, None)
@@ -1460,12 +1470,9 @@ async def linear_webhook(request: Request):
                     ticket_id, pr_number, ci,
                 )
                 _redirect_to_ci_in_progress(ticket_id, pr_number, owner, repo, branch, data)
-                return {
-                    "status": "ci_redirect",
-                    "ticket": ticket_id,
-                    "pr": pr_number,
-                    "reason": "CI not passed — intercepted before Reviewer dispatch",
-                }
+                # The task was never dispatched to an agent — it was redirected to CI polling.
+                # Complete it as success (it did its job: triggered CI monitoring).
+                return AgentTaskRunResult(outcome="ci_redirect")
             else:
                 logger.info(
                     "CI PASSED for %s (PR #%d) — proceeding with Reviewer dispatch.",
