@@ -108,12 +108,20 @@ pipeline:
       If a QA agent has posted a failure comment, READ it carefully and fix the reported issue.
       Your job is to implement the requirements of the Linear ticket.
       Do NOT move any ticket to 'Done' or 'Approved For Delivery' — those are human-only states.
-      IMPORTANT: This project uses pnpm, NOT npm. Always use pnpm commands:
-        - BEFORE running any command: `cd maestro/true-review`
+      IMPORTANT: This project uses pnpm, NOT npm. Always use pnpm commands.
+      Terminal sessions may **persist cwd** across tool calls. The True Review checkout path is
+      **`maestro/true-review/` relative to the Hermes monorepo root** (the directory that contains
+      both `maestro/` and `run_agent.py`).
+        - **Once per session**, `cd` to that directory (from repo root: `cd maestro/true-review`).
+          If you are **already** inside `.../maestro/true-review` (e.g. cwd ends with `true-review`),
+          **do not** run `cd maestro/true-review` again — it will fail. From there use relative paths
+          like `apps/frontend`, `apps/backend`, or pass `workdir` on the terminal tool to an absolute path.
+        - Optional operator fix: set env **`TERMINAL_CWD`** for the webhook process to the absolute
+          `.../hermes-agent/maestro/true-review` so commands can start in the app root without chaining `cd`.
         - Run frontend tests: `cd apps/frontend && pnpm run test:ci` (NOT `npm run test`)
         - Install deps: `pnpm install` (NOT `npm install`)
         - Add a package: `pnpm add <package>` (NOT `npm install`)
-        - Working directory for this project is: `maestro/true-review/`
+        - Primary working tree for app work: `maestro/true-review/` (from monorepo root)
       Backend CI RULE (mandatory):
         - `cd apps/backend && ./mvnw test` is the SOLE gate for backend code. `./mvnw compile`
           is NOT sufficient — Quarkus CDI bootstrap errors only appear during `test`.
@@ -226,20 +234,29 @@ pipeline:
          b. Check BOTH the pullRequest field AND attachments (Resources section).
          c. The pullRequest.baseRefName MUST be 'develop' — if it targets 'main' or anything else,
             this is a blocker. Post a comment noting the wrong base branch and STOP.
-         d. If pullRequest.state is 'MERGED' or 'CLOSED', the PR is already done — post a
-            comment on the Linear ticket noting this and STOP.
-         e. If pullRequest.isDraft is TRUE, ignore this PR — it is not ready for review.
+         d. If pullRequest.isDraft is TRUE, ignore this PR — it is not ready for review.
             Post a comment on the Linear ticket noting "Draft PR ignored, waiting for Developer
             to mark it ready" and STOP without taking any further action.
-         f. If there are multiple attachments with PR URLs, use the MOST RECENT open PR
+         e. If there are multiple attachments with PR URLs, use the MOST RECENT open PR
             (skip any that are draft).
-         g. Extract the GitHub repo name and PR number from the PR URL.
+         f. Extract the GitHub repo name and PR number from the PR URL.
             Format: https://github.com/owner/repo/pull/123 → repo='owner/repo', pr_number=123
-         h. IMMEDIATELY check for concurrent review: Call linear_read_comments(ticket_id).
+         g. IMMEDIATELY check for concurrent or prior review: Call linear_read_comments(ticket_id).
             If ANY existing comment contains "## Reviewer:" (from any prior Reviewer session on this
-            same ticket), do NOT proceed with a new review. Post a brief comment "Review already
-            in progress or completed by another Reviewer instance — skipping." and STOP.
-            Do NOT post duplicate reviews. Do NOT approve or merge if another instance has claimed the review.
+            same ticket):
+              - If pullRequest.state is 'MERGED' or 'CLOSED': a prior Reviewer already approved
+                and merged this PR. Post a brief comment "Prior review found and PR already merged.
+                Moving to Ready For QA." then call linear_update_status(ticket_id, 'Ready For QA')
+                as your LAST action and STOP. Do NOT re-review or re-approve.
+              - If pullRequest.state is OPEN: a prior Reviewer already claimed this review.
+                Post a brief comment "Review already completed by another Reviewer instance — skipping."
+                and STOP. Do NOT post duplicate reviews. Do NOT approve or merge again.
+            If NO prior "## Reviewer:" comment exists, proceed to Step 0h (merged PR with no prior review).
+         h. If pullRequest.state is 'MERGED' or 'CLOSED' (no prior review found): post a comment
+            on the Linear ticket noting "PR is already merged. No prior Reviewer comment found on this
+            ticket. Please verify the review was completed and move to the appropriate state manually."
+            and STOP. (This is an unusual state — a merged PR with no review comment should be
+            investigated by a human.)
 
       1. Read the Linear ticket comments first — check for prior review attempts, blockers, or
          context from previous agents.
@@ -352,6 +369,17 @@ pipeline:
       3. Pull the merged branch and test it as it will run in `develop`:
          a. Git checkout `develop` and git pull origin `develop` to get the merged code.
          b. Spin up the application stack (e.g., using Docker Compose). Wait for containers to be healthy.
+         b2. If the backend fails to start due to **Flyway migration mismatch** (environmental DB drift),
+             you MUST reset the local dev DB and retry (this is safe for local QA only):
+               - Symptoms include: "Migration checksum mismatch", "Detected applied migration not resolved locally",
+                 or migrations like `1.5.2/1.5.3` applied in DB but missing from the current `develop` checkout.
+               - Fix:
+                   1) From the True Review repo root (directory containing `docker-compose.yml`), run:
+                      `docker compose down -v`
+                   2) Then bring it back up clean:
+                      `docker compose up -d postgres redis backend frontend`
+                   3) Re-run backend start / health check, then continue QA.
+             Do NOT proceed with Playwright if the backend cannot start.
          c. IMPORT SEED DATA if the database is empty. Check if the app has seed/test data
             (e.g., SQL migration files, CSV fixtures, or a seed script). If no seed data exists,
             either:
@@ -360,7 +388,8 @@ pipeline:
               - Check for a seed/import script in the repo and run it.
             Do NOT skip this step — T8 (products returned) requires data in the DB.
          d. LOGIN before testing any protected pages. Read credentials from the `.env.testing` file
-            at EXACT path `/Users/maestro/faworkshop/true-review/.env.testing`. Load FIREBASE_TEST_EMAIL and FIREBASE_TEST_PASSWORD
+            at EXACT path `/Users/maestro/faworkshop/hermes-agent/maestro/true-review/.env.testing` (or the path
+            provided by `QA_TESTING_ENV_FILE` if set). Load FIREBASE_TEST_EMAIL and FIREBASE_TEST_PASSWORD
             from that file and use them to log in:
               Email: FIREBASE_TEST_EMAIL from .env.testing
               Password: FIREBASE_TEST_PASSWORD from .env.testing
