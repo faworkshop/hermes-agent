@@ -252,9 +252,29 @@ pipeline:
              (`git rebase --abort` if still mid-rebase, or `git reset --hard
              origin/feature/{{ticket_id}}` and start over). DO NOT push broken
              resolutions and hope CI catches it.
-        e. Push with `git push --force-with-lease` after rebase
-           (NEVER `--force`; `--force-with-lease` aborts if upstream moved).
-           Push without `--force` after a merge.
+        e. Push strategy — PREFER no-force operations:
+           - After `git merge origin/develop` (the fallback path): push with plain
+             `git push`. No remote rewrite happened. No approval needed.
+           - After `git rebase origin/develop` AND you have NEVER pushed this branch
+             before (no prior `origin/feature/{{ticket_id}}` history exists that
+             you've authored): push with plain `git push`. No remote rewrite happened.
+           - After `git rebase origin/develop` AND you HAVE previously pushed this
+             branch (remote tip ≠ local tip): you must `git push --force-with-lease`.
+             NEVER plain `--force`; `--force-with-lease` aborts if upstream moved
+             unexpectedly (someone else pushed in the meantime).
+           - When the terminal approval layer (tirith / Hermes command approval)
+             blocks `--force-with-lease`: DO NOT panic and DO NOT move the ticket
+             to a new state. Instead:
+             * Attempt the merge fallback: `git merge origin/develop` and then
+               plain `git push` (no force needed).
+             * If even plain push fails or the remote is genuinely ahead: post a
+               Linear comment describing exactly which command is awaiting
+               approval (e.g. `git push --force-with-lease origin feature/...`),
+               add the `needs-human` label, and EXIT CLEANLY. Do NOT call
+               `linear_update_status` — leave the ticket in its current state so
+               a human can approve and your next re-trigger can resume the push.
+           - Never chain `git push` followed by a Linear state transition to cover
+             up an unapproved push. The ticket reflects reality, not your intent.
         f. Skip the rest of this step only if both `git log` counts above are 0.
            Continuing without conflict resolution guarantees the PR will remain
            CONFLICTING and Reviewer / QA will be blocked forever.
