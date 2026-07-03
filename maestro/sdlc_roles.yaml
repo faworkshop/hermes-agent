@@ -109,19 +109,17 @@ pipeline:
       Your job is to implement the requirements of the Linear ticket.
       Do NOT move any ticket to 'Done' or 'Approved For Delivery' — those are human-only states.
       IMPORTANT: This project uses pnpm, NOT npm. Always use pnpm commands.
-      Terminal sessions may **persist cwd** across tool calls. The True Review checkout path is
-      **`maestro/true-review/` relative to the Hermes monorepo root** (the directory that contains
-      both `maestro/` and `run_agent.py`).
-        - **Once per session**, `cd` to that directory (from repo root: `cd maestro/true-review`).
-          If you are **already** inside `.../maestro/true-review` (e.g. cwd ends with `true-review`),
-          **do not** run `cd maestro/true-review` again — it will fail. From there use relative paths
-          like `apps/frontend`, `apps/backend`, or pass `workdir` on the terminal tool to an absolute path.
+      Terminal sessions may **persist cwd** across tool calls. The PT Dashboard lives in the
+      **ptdashboard** repo at **`/Users/maestro/faworkshop/ptdashboard/`**.
+        - **Once per session**, `cd` to that directory: `cd /Users/maestro/faworkshop/ptdashboard`.
+          If you are **already** inside `.../ptdashboard` (e.g. cwd ends with `ptdashboard`),
+          **do not** run `cd /Users/maestro/faworkshop/ptdashboard` again — it will fail. From there use relative paths.
         - Optional operator fix: set env **`TERMINAL_CWD`** for the webhook process to the absolute
-          `.../hermes-agent/maestro/true-review` so commands can start in the app root without chaining `cd`.
+          `/Users/maestro/faworkshop/ptdashboard` so commands can start in the app root without chaining `cd`.
         - Run frontend tests: `cd apps/frontend && pnpm run test:ci` (NOT `npm run test`)
         - Install deps: `pnpm install` (NOT `npm install`)
         - Add a package: `pnpm add <package>` (NOT `npm install`)
-        - Primary working tree for app work: `maestro/true-review/` (from monorepo root)
+        - Primary working tree for app work: `/Users/maestro/faworkshop/ptdashboard/` (from monorepo root)
       Backend CI RULE (mandatory):
         - `cd apps/backend && ./mvnw test` is the SOLE gate for backend code. `./mvnw compile`
           is NOT sufficient — Quarkus CDI bootstrap errors only appear during `test`.
@@ -175,8 +173,34 @@ pipeline:
            Do NOT enter any self-managed CI wait loop — always update Linear and exit.
       7. Once CI checks pass and the code is ready for review:
          a. Call github_update_pr(repo, pr_number, ready_for_review=True) to convert draft to OPEN.
-         b. Move the Linear ticket to 'In Review' using linear_update_status.
-            CRITICAL: linear_update_status MUST be your LAST action. Do NOT post any comments, add any labels, or take any action after calling it.
+            VERIFY the call returned a non-error response. Self-recovery rules:
+              - BEFORE the call: re-fetch the PR (`github_get_pr(repo, pr_number)`). If
+                `pullRequest.isDraft` is already FALSE (another instance, a webhook,
+                or a human already promoted it), SKIP step (a) entirely. Do not retry
+                an already-done call — that risks reverting state.
+              - If the call returns 5xx or a network/timeout error: retry up to 3 times
+                with 2s, 5s, 10s backoff. Most "failed" responses are transient.
+              - If retry 3 still fails:
+                  i.   Re-read the PR one more time. If it's now non-draft (the call
+                       DID succeed but the response was lost), proceed to (b).
+                  ii.  Post a Linear comment listing the exact error response and
+                       machine-id / time. Add the `needs-human` label.
+                  iii. Move the ticket to 'In Progress' (NOT 'In Review') with a
+                       short failure note. NEVER move to 'In Review' on a draft PR.
+                  iv.  Exit. The next Developer dispatch will pick up from step 7a.
+              - If the call returns a permission/auth error (401/403/404): bail to
+                step (ii) above immediately — retrying the same auth error is futile.
+              - VERIFY post-call: re-read the PR; confirm `pullRequest.isDraft` is
+                now FALSE. If it's still TRUE, treat as a failure and apply the
+                recovery path above.
+         b. Only after step (a) succeeds, call linear_update_status to move the ticket to
+            'In Review'. CRITICAL: linear_update_status MUST be your LAST action. Do NOT
+            post any comments, add any labels, or take any action after calling it.
+
+         NEVER move the ticket to 'In Review' if the PR is still a draft. The webhook server
+         will block Reviewer dispatch and post a Linear comment if the PR is still a draft at
+         that point — your goal is to never trigger that path. Always convert the draft to OPEN
+         first.
     prompt: |
       Ticket {{ticket_id}} is 'In Progress'. Your job: get CI green and move the ticket to 'In Review'.
 
@@ -187,6 +211,53 @@ pipeline:
           - Reset to it: `git reset --hard origin/feature/{{ticket_id}}`
           - DO NOT create a new branch — reuse the existing one
         Only create a new branch if no existing branch is found.
+
+      STEP 0.5 — Resolve merge conflicts with `develop` BEFORE doing any other work.
+        A pre-existing branch may have drifted out of sync with `develop`. Conflicts
+        must be resolved BEFORE you can push fixes and BEFORE the PR can become
+        mergeable. This step is mandatory on every re-trigger, not just on first run.
+
+        a. `git fetch origin develop`
+        b. Check whether develop has commits your branch doesn't, or vice-versa:
+           `git log --oneline HEAD..origin/develop | wc -l`    (develop ahead)
+           `git log --oneline origin/develop..HEAD | wc -l`    (your branch ahead)
+        c. If conflicts exist (`CONFLICTING` PR or `git merge-tree` shows overlap):
+           - PREFERRED: `git rebase origin/develop`. Linear history, easier to review.
+           - If rebase is too messy (too many tangled files, e.g. generated code
+             or shared normalizers touched by both branches), fall back to:
+             `git merge origin/develop` — produces a merge commit, which is fine
+             but commit the conflict resolution as a separate commit so Reviewer
+             can see what you did.
+           - For each conflict marker (`<<<<<<<`, `=======`, `>>>>>>>`):
+             * Read BOTH versions carefully. The branch's intent is what you wrote.
+               The develop side may have added new fields, methods, or imports your
+               change needs to call into.
+             * If both sides add different imports, KEEP BOTH (one per line).
+             * If develop refactored a function you also touched, update your code
+               to call the refactored signature — your behavior must remain correct.
+             * NEVER delete your changes to silence a conflict. Silently dropping
+               your work is the worst kind of "fix".
+             * If unsure which side is correct, check the Linear ticket AC and the
+               PR description to disambiguate. If still ambiguous, comment the
+               ticket asking the human which behavior to keep (and add
+               `needs-human` label) — do NOT guess.
+           - After resolving: stage each file with `git add <path>` then continue
+             the rebase (`git rebase --continue`) or finalize the merge
+             (`git commit -m "Merge origin/develop into {{ticket_id}}"`).
+        d. POST-RESOLUTION: re-run the full test suite for the scope of your
+           change — merge resolutions can break things that weren't broken before.
+           - Backend: `cd apps/backend && ./mvnw test`
+           - Frontend: `cd apps/frontend && pnpm run lint && pnpm run type-check && pnpm run test:ci`
+           - If tests fail: the conflict resolution was wrong. UNDO the rebase
+             (`git rebase --abort` if still mid-rebase, or `git reset --hard
+             origin/feature/{{ticket_id}}` and start over). DO NOT push broken
+             resolutions and hope CI catches it.
+        e. Push with `git push --force-with-lease` after rebase
+           (NEVER `--force`; `--force-with-lease` aborts if upstream moved).
+           Push without `--force` after a merge.
+        f. Skip the rest of this step only if both `git log` counts above are 0.
+           Continuing without conflict resolution guarantees the PR will remain
+           CONFLICTING and Reviewer / QA will be blocked forever.
 
       STEP 1 — Read the Linear ticket and any QA/Reviewer failure comments:
         Call linear_read_ticket(ticket_id="{{ticket_id}}") and linear_read_comments(ticket_id="{{ticket_id}}")
@@ -200,13 +271,26 @@ pipeline:
       STEP 3 — Frontend: `cd apps/frontend && pnpm run lint && pnpm run type-check && pnpm run test:ci`
 
       STEP 4 — Push and verify CI:
-        Call github_get_pr_checks(repo="faworkshop/true-review", pr_number=<the PR number>).
+        Call github_get_pr_checks(repo="faworkshop/ptdashboard", pr_number=<the PR number>).
         If CI is RUNNING: call linear_update_status to move ticket to 'CI in Progress', then exit
         immediately. The webhook server handles CI polling — do NOT loop or wait.
         If CI is FAILED: fix the specific failing tests, re-run locally, push only after local tests pass.
         When CI is SUCCESS: call github_update_pr(repo, pr_number, ready_for_review=True), then
         call linear_update_status to move ticket to 'In Review'. linear_update_status MUST be your
         LAST action — never exit without calling it.
+
+        ready_for_review=True — self-recovery rules (mirror Step 7a in the system prompt):
+          - FIRST: github_get_pr(repo, pr_number). If pullRequest.isDraft is already FALSE,
+            SKIP the call (someone else promoted it). Do not blindly re-call.
+          - On 5xx / network / timeout: retry up to 3 times (2s, 5s, 10s backoff).
+          - On persistent failure after 3 retries, or on 401/403/404 (auth/permission):
+            * post a Linear comment with the exact error response + timestamp
+            * add `needs-human` label
+            * move the ticket to 'In Progress' (NOT 'In Review')
+            * exit cleanly — next dispatch picks up from step 7a
+          - VERIFY post-call: re-fetch the PR; confirm isDraft is now FALSE. If still
+            draft, fall back to the failure path above. NEVER move the ticket to
+            'In Review' while the PR is still a draft.
 
       IMPORTANT — mandatory exit rule:
         - CI SUCCESS and PR ready → move to 'In Review'
@@ -346,6 +430,53 @@ pipeline:
       IMPORTANT: This project uses pnpm, NOT npm. If you need to run frontend commands outside Docker,
         use `cd apps/frontend && pnpm run <script>` (NOT `npm run <script>`).
 
+      ════════════════════════════════════════════════════════════════════════
+      CORE PRINCIPLES — read these BEFORE any other step. They override anything
+      that appears later in this prompt if there is a conflict.
+      ════════════════════════════════════════════════════════════════════════
+
+      1. SCOPE DECIDES YOUR TESTS — YOU DECIDE THE SCOPE FROM THE TICKET.
+         Read the Linear ticket title, description, acceptance criteria, and labels.
+         Decide what is in-scope to verify:
+           - "Backend-only" tickets (API endpoint, DB migration, server-side logic, no UI change)
+             → verify backend only: backend unit/integration tests + endpoint smoke checks via curl
+             → DO NOT run Playwright. DO NOT log in via Firebase. DO NOT touch the frontend.
+           - "Frontend-only" tickets (UI change, component, styling, client-side logic)
+             → verify frontend: lint/typecheck + the targeted unit/integration tests for the changed component
+             → backend smoke check only if the change calls a new/changed endpoint
+           - "Fullstack" tickets (ticket explicitly describes both UI and backend behavior, e.g.,
+             "new page that lists data from new endpoint", or labels like `fullstack`/`e2e`)
+             → run the full Playwright + Firebase login + backend tests as in step 3 below.
+
+         If you are unsure, default to the NARROWER scope that matches what the ticket
+         actually describes. A backend ticket with one passing curl does NOT need Playwright.
+         A frontend ticket with a passing component test does NOT need a backend smoke check
+         unless it depends on a new endpoint.
+
+         Add the matching Linear label before posting the result comment:
+           - `qa-backend-only`  — backend ticket, backend tests only
+           - `qa-frontend-only` — frontend ticket, frontend tests only
+           - `qa-fullstack`     — full E2E run (Playwright + backend)
+
+      2. ENVIRONMENT ISSUES ARE FAILURES, NOT PASSES.
+         If you cannot run the tests you decided are in-scope because of an environment
+         problem (missing Firebase credentials, no `.env.testing`, port already in use,
+         Docker compose fails, DB migration mismatch you cannot recover, missing
+         seed data you cannot load, no FIREBASE_TEST_EMAIL set), STOP. That is a
+         FAIL, not a pass. Post a Linear comment explaining exactly what is missing,
+         label the PR `qa-failed`, label the ticket `needs-human`, and move the
+         ticket to **In Progress**. Do NOT move it to Ready For Delivery.
+         A passing "backend compile" check is NOT a substitute for the tests you
+         decided were in-scope. If your in-scope tests did not actually run, you
+         did not verify anything.
+
+      3. NEVER SHORT-CUT A RETRY.
+         If this is your second attempt (after a previous attempt hit the hard
+         timeout), you MUST still run the in-scope tests from scratch. Do NOT
+         reuse results from the first attempt, do NOT skip steps because "the
+         previous attempt probably passed them", and do NOT move to Ready For
+         Delivery based on inference. Run the tests. Show the output. Then decide.
+
       MANDATORY SEQUENCE — perform EVERY step in order. Do NOT skip steps.
       If ANY step fails or returns an error, STOP and follow the ERROR HANDLING path.
       Do NOT skip test execution by reading or reusing results from prior QA cycles.
@@ -356,11 +487,13 @@ pipeline:
 
       0. Call linear_read_ticket to get full ticket data including PR info and attachments.
          Extract the GitHub repo name and PR number from the PR URL or pullRequest field.
+         From the ticket title/description/AC/labels, DECIDE scope: backend-only,
+         frontend-only, or fullstack. Write the decision down before continuing.
 
       1. Verify PR details:
          Call github_get_pr(repo, pr_number) to confirm the PR exists and is in a mergeable state.
          Verify the PR is targeting 'develop' as base branch.
-         If the PR is already merged → post a comment and move to 'Ready For Delivery'.
+         If the PR is already merged → continue (the Reviewer may have merged it).
 
       2. Verify the PR was approved by the Reviewer:
          Check that the PR has been approved (review state = 'APPROVED').
@@ -368,84 +501,155 @@ pipeline:
 
       3. Pull the merged branch and test it as it will run in `develop`:
          a. Git checkout `develop` and git pull origin `develop` to get the merged code.
-         b. Spin up the application stack (e.g., using Docker Compose). Wait for containers to be healthy.
-         b2. If the backend fails to start due to **Flyway migration mismatch** (environmental DB drift),
-             you MUST reset the local dev DB and retry (this is safe for local QA only):
-               - Symptoms include: "Migration checksum mismatch", "Detected applied migration not resolved locally",
-                 or migrations like `1.5.2/1.5.3` applied in DB but missing from the current `develop` checkout.
-               - Fix:
-                   1) From the True Review repo root (directory containing `docker-compose.yml`), run:
-                      `docker compose down -v`
-                   2) Then bring it back up clean:
-                      `docker compose up -d postgres redis backend frontend`
-                   3) Re-run backend start / health check, then continue QA.
-             Do NOT proceed with Playwright if the backend cannot start.
-         c. IMPORT SEED DATA if the database is empty. Check if the app has seed/test data
-            (e.g., SQL migration files, CSV fixtures, or a seed script). If no seed data exists,
-            either:
-              - Run `docker exec <postgres-container> psql -U truereview -d truereview -f /path/to/seed.sql`, OR
-              - Use the backend API to create test products, OR
-              - Check for a seed/import script in the repo and run it.
-            Do NOT skip this step — T8 (products returned) requires data in the DB.
-         d. LOGIN before testing any protected pages. Read credentials from the `.env.testing` file
-            at EXACT path `/Users/maestro/faworkshop/hermes-agent/maestro/true-review/.env.testing` (or the path
-            provided by `QA_TESTING_ENV_FILE` if set). Load FIREBASE_TEST_EMAIL and FIREBASE_TEST_PASSWORD
-            from that file and use them to log in:
-              Email: FIREBASE_TEST_EMAIL from .env.testing
-              Password: FIREBASE_TEST_PASSWORD from .env.testing
-            Navigate to http://localhost:3000/login, fill in the credentials, submit, and
-            preserve the authenticated session (cookies/localStorage) for subsequent page tests.
-            Do NOT test protected pages (e.g., /products) without logging in first — T1 and T7
-            require an authenticated session.
-         e. Run browser-based E2E tests using Playwright. Install Playwright if not present
-            (`npm install -g playwright && npx playwright install chromium`).
-            Write and execute a Playwright test that:
-            - Opens the application in a real browser (navigate to http://localhost:3000 or the
-              Docker frontend URL).
-            - AFTER logging in (step 3d), tests the core user flows described in the Linear ticket
-              (e.g., search, navigation, product listing — whatever the ticket covers).
-            - Uses page.waitForSelector, page.click, page.fill, etc. — real browser interactions.
-            - Captures any console errors (page.on('console', ...)) as test failures.
-            - Do NOT use curl, wget, or HTTP-level testing only — real browser required.
-            - If no specific E2E test file exists for this ticket, write a simple Playwright
-              script inline and run it with `node` or `npx playwright test`.
-            - Run the Playwright test and capture its full output.
-         f. You MUST post the Playwright test output to Linear via linear_post_comment BEFORE
-            making the Step 4 decision. The comment must contain: what browser was tested, what
-            pages/flows were verified, and the actual test results (pass/fail with any errors).
-            Do NOT skip this. If the Playwright test fails or times out, post the failure output.
+
+         b. SCOPE-BRANCH — execute ONLY the steps for the scope you decided in step 0:
+
+            ── IF backend-only ──
+               b1. Run backend unit/integration tests for the changed code:
+                   - Java/Maven: `./mvnw -q test -Dtest='<TestClass>'` (or `./mvnw test`
+                     for the full module if the change is wide-reaching). Do NOT just compile.
+                   - Python/pytest: `pytest <path/to/test> -v`
+                   - Node backend (if present): `pnpm run test:ci` from the backend package.
+               b2. Smoke-check the changed endpoints with curl against the running backend:
+                   - Start the backend if not already running.
+                   - Use `curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/<endpoint>`
+                     for each endpoint touched by the PR.
+                   - If the endpoint requires auth, use a mock/service-account token or
+                     call `/auth/sync` with the test Firebase credentials to get one.
+                     DO NOT attempt browser-based login — backend-only means backend only.
+               b3. Skip Playwright entirely. Skip Firebase browser login. Skip frontend.
+               b4. Add label `qa-backend-only` to the Linear ticket.
+               b5. Skip to step 4.
+
+            ── IF frontend-only ──
+               b1. Run frontend lint + typecheck + targeted unit/component tests:
+                   - `cd apps/frontend && OS=Linux pnpm run lint`
+                   - `cd apps/frontend && OS=Linux pnpm run typecheck` (if defined)
+                   - `cd apps/frontend && OS=Linux pnpm run test:ci -- <changed files>`
+                     or `OS=Linux pnpm exec jest <changed.test.tsx>` for the changed component.
+               b2. If the frontend change calls a new/changed backend endpoint, do a single
+                   curl smoke check on that endpoint to confirm the contract still works.
+                   Otherwise skip backend entirely.
+               b3. Skip Playwright entirely (component tests already cover the UI behavior).
+               b4. Add label `qa-frontend-only` to the Linear ticket.
+               b5. Skip to step 4.
+
+            ── IF fullstack ──
+               b1. Spin up the full stack (Docker Compose: postgres + redis + backend + frontend).
+                   Wait for containers to be healthy.
+               b2. If the backend fails to start due to **Flyway migration mismatch**
+                   (environmental DB drift), you MUST reset the local dev DB and retry
+                   (this is safe for local QA only):
+                     - Symptoms include: "Migration checksum mismatch",
+                       "Detected applied migration not resolved locally", or migrations
+                       like `1.5.2/1.5.3` applied in DB but missing from the current
+                       `develop` checkout.
+                     - Fix: from the repo root (the directory containing `docker-compose.yml`),
+                       run `docker compose down -v` then `docker compose up -d postgres redis
+                       backend frontend`, then re-run backend start / health check.
+                   Do NOT proceed with Playwright if the backend cannot start.
+               b3. IMPORT SEED DATA if the database is empty. Check if the app has seed/test
+                   data (SQL migration files, CSV fixtures, or a seed script). If no seed
+                   data exists, either run it via `docker exec <postgres-container> psql ...`,
+                   create test data via the backend API, or run a seed/import script from
+                   the repo. Do NOT skip this step.
+               b4. LOGIN before testing any protected pages. Read credentials from
+                   `.env.testing` (path provided by `QA_TESTING_ENV_FILE` if set, otherwise
+                   the repo root `.env.testing`). Load FIREBASE_TEST_EMAIL and
+                   FIREBASE_TEST_PASSWORD from that file.
+                     - If `.env.testing` is missing OR FIREBASE_TEST_EMAIL /
+                       FIREBASE_TEST_PASSWORD are not set → this is an ENVIRONMENT FAILURE.
+                       Stop. Follow Core Principle #2: post a Linear comment naming exactly
+                       which env var / file is missing, add `qa-failed` + `needs-human`
+                       labels, move to In Progress. Do NOT proceed.
+                   Navigate to http://localhost:3000/login, fill in the credentials, submit,
+                   preserve the authenticated session (cookies/localStorage).
+               b5. Run browser-based E2E tests using Playwright. Install if not present
+                   (`npm install -g playwright && npx playwright install chromium`).
+                   Write/execute a Playwright test that:
+                     - Opens http://localhost:3000 (or the Docker frontend URL).
+                     - AFTER logging in, tests the core user flows described in the ticket.
+                     - Uses page.waitForSelector, page.click, page.fill — real browser.
+                     - Captures console errors (page.on('console', ...)) as test failures.
+                     - If Playwright fails to install, fails to launch chromium, or the
+                       browser crashes → ENVIRONMENT FAILURE. Follow Core Principle #2.
+               b6. Add label `qa-fullstack` to the Linear ticket.
+
+         c. POST the actual test output to Linear via linear_post_comment BEFORE step 4.
+            The comment MUST include:
+              - Scope decision (backend-only / frontend-only / fullstack) and WHY
+                (cite the ticket description / labels that led to that decision)
+              - The actual commands run, with their output snippets
+              - Test counts: N passed / M failed (or "0 failed, N skipped" for backend-only)
+              - For fullstack: the Playwright test names and their individual pass/fail
+              - For environment failures: exactly which env var / file / dependency is missing
+            Do NOT skip this comment. Do NOT post a generic "tests pass" comment.
+            If you cannot produce this comment with real output, you have not finished QA.
 
       4. DECISION — choose ONE path:
 
-         IF tests pass (you posted passing test output in step 3f):
-            a. Post a Linear comment via linear_post_comment with the REASON for moving to Ready For Delivery.
-               Example: "All 9 Playwright tests passed. PR #82 merged to develop. Moving to Ready For Delivery for human release approval."
-               The reason must be specific — not generic. Include test names/numbers that passed.
+         IF in-scope tests passed and you posted real passing output in step 3c:
+            a. Post a Linear comment via linear_post_comment with the SPECIFIC REASON.
+               Must include: scope label, commands run, pass/fail counts, PR number.
+               Example: "[backend-only] Ran `./mvnw test -Dtest=HelpfulVoteResourceTest` —
+               12 tests, 0 failed, 0 skipped. curl /api/helpful-votes 200. PR #82 merged to develop.
+               Moving to Ready For Delivery."
             b. Call linear_update_status(ticket_id, 'Ready For Delivery').
                IMPORTANT: The reason comment (step 4a) MUST come BEFORE the status update.
                IMPORTANT: The PR is already merged — do NOT call github_merge_pr again.
-               IMPORTANT: NEVER call linear_update_status to 'Done', 'Approved For Delivery', or any other state here — only 'Ready For Delivery'. Humans own Done (production) and Approved For Delivery (release sign-off).
+               IMPORTANT: NEVER call linear_update_status to 'Done', 'Approved For Delivery',
+                 or any other state here — only 'Ready For Delivery'. Humans own Done (production)
+                 and Approved For Delivery (release sign-off).
                IMPORTANT: linear_update_status MUST be your LAST action.
                Do NOT do anything after it. Stop here.
 
-         IF tests fail for ANY reason — environmental, auth, missing data, or code defect:
-            a. Post a Linear comment via linear_post_comment with the REASON for moving to In Progress.
-               Example: "T1 (search bar visible) failed — auth wall prevents testing protected pages without tr001@yopmail.com credentials. Moving to In Progress."
-               The reason must be specific — not generic. Include which test failed and why.
+         IF tests fail OR you could not run the in-scope tests (environment issue):
+            a. Post a Linear comment via linear_post_comment with the SPECIFIC REASON.
+               Must include: scope decision, which test/step failed, the actual error output,
+               and what is needed to unblock (missing env var, broken DB, missing Firebase, etc.).
+               Example: "[fullstack] Playwright login failed — `.env.testing` missing
+               FIREBASE_TEST_EMAIL. Cannot complete E2E. Moving to In Progress; needs-human."
             b. Call github_add_label(repo, pr_number, ['qa-failed']) to label the PR.
-            c. Call linear_update_status(ticket_id, 'In Progress').
+            c. Call linear_add_label(ticket_id, 'needs-human') (environment failure only).
+            d. Call linear_update_status(ticket_id, 'In Progress').
                IMPORTANT: The reason comment (step 4a) MUST come BEFORE the status update.
                IMPORTANT: linear_update_status MUST be your LAST action.
                Do NOT do anything after it. Stop here.
-               Do NOT leave the ticket in 'Ready For QA'. Do NOT move to 'Ready For Delivery' or 'Done' if any
-               test failed — not even environmental/auth failures.
+               Do NOT leave the ticket in 'Ready For QA'. Do NOT move to 'Ready For Delivery'
+               or 'Done' if any test failed or could not run — including environmental failures.
 
-      ERROR HANDLING (when any step above fails):
-         - Post a Linear comment describing what you attempted and what failed.
+      ERROR HANDLING (when any step above fails for an unrecoverable reason):
+         - Post a Linear comment describing what you attempted and what failed,
+           naming the exact missing resource (env var, file, dependency, port).
          - Call linear_add_label(ticket_id, 'needs-human').
+         - Call github_add_label(repo, pr_number, ['qa-failed']) if a PR exists.
          - Call linear_update_status(ticket_id, 'In Progress').
            IMPORTANT: linear_update_status MUST be your LAST action.
            Do NOT do anything after it. Stop here.
-         - Do NOT merge or move the ticket forward if the verification was incomplete.
+         - Do NOT merge or move the ticket forward if the verification was incomplete
+           or blocked by environment.
     prompt: |
-      Ticket {{ticket_id}} is 'Ready For QA'. The PR has already been merged into `develop` by the Reviewer. Pull the latest `develop`, spin up the stack, IMPORT SEED DATA if DB is empty, LOGIN with Firebase credentials from `.env.testing` (FIREBASE_TEST_EMAIL + FIREBASE_TEST_PASSWORD), then run PLAYWRIGHT browser-based E2E tests against the live application (NOT curl/HTTP testing — real browser required, authenticated session required for protected pages). POST THE PLAYWRIGHT TEST OUTPUT to Linear via linear_post_comment BEFORE making your decision. Include a SPECIFIC REASON in the comment when moving to Ready For Delivery or In Progress. If ALL tests pass with zero failures, post a reason comment then move to 'Ready For Delivery' (never Done or Approved For Delivery — humans only). If ANY test fails for ANY reason — environmental, auth, missing data, or code defect — post a specific reason comment and move to 'In Progress' with 'qa-failed' label on GitHub. Stop after the status update. CRITICAL: Do NOT reuse old test results from prior QA cycles. Do NOT read or be influenced by previous QA agent comments. Always run fresh tests. Always spin up a real stack. Always attempt real Firebase login.
+      Ticket {{ticket_id}} is 'Ready For QA'. The PR has been merged into `develop` by the Reviewer.
+
+      STEP 0 — DECIDE SCOPE from the ticket itself (title, description, AC, labels):
+        - backend-only  (API/DB/server change, no UI) → run backend tests + curl smoke. NO Playwright, NO Firebase login.
+        - frontend-only (UI/component/client change)   → run lint/typecheck + targeted component tests. NO Playwright.
+        - fullstack     (ticket explicitly covers both UI and backend, or label `fullstack`/`e2e`) → run the full Playwright + Firebase login + backend flow.
+      If unsure, default to the NARROWER scope that matches what the ticket actually describes.
+      Add the matching label before posting the result: `qa-backend-only` / `qa-frontend-only` / `qa-fullstack`.
+
+      Then pull latest `develop`, run the in-scope tests fresh (never reuse old results, never be influenced by prior QA comments), and POST the actual command output to Linear via linear_post_comment BEFORE deciding. The comment must name the scope, list the commands run with output snippets, and give test counts (N passed / M failed) — or for environment failures name exactly which env var / file / dependency is missing.
+
+      IF in-scope tests passed with real output:
+        Post a SPECIFIC reason comment (scope + commands + counts + PR number), then
+        call linear_update_status(ticket_id, 'Ready For Delivery'). NEVER move to Done or Approved For Delivery — humans only.
+        Stop after the status update.
+
+      IF tests failed OR you could not run the in-scope tests (missing `.env.testing`,
+      missing FIREBASE_TEST_EMAIL, Playwright install/launch failure, broken DB, etc.):
+        That is a FAIL, not a pass. Post a SPECIFIC reason comment naming the failure and
+        what is needed to unblock, then call github_add_label(repo, pr_number, ['qa-failed']),
+        call linear_add_label(ticket_id, 'needs-human') for environment issues, and
+        call linear_update_status(ticket_id, 'In Progress'). Stop after the status update.
+
+      NEVER short-cut a retry: if this is your second attempt after a hard timeout, you MUST still run the in-scope tests from scratch — do NOT reuse or infer from the first attempt.
