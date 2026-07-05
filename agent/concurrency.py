@@ -316,22 +316,25 @@ class ConcurrencyManager:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if max_active_tickets > 0:
+                # Active count must be role-scoped: a PM task holding a slot
+                # should not block Developer/Reviewer/QA claim attempts (and
+                # vice versa). PM is cheap, dev/reviewer/qa are heavy — they
+                # have separate caps (HERMES_MAX_ACTIVE_PM_TICKETS vs
+                # HERMES_MAX_ACTIVE_TICKETS) and must not interfere with each
+                # other. Previously this unioned locks + running tasks across
+                # all roles, which meant an orphaned PM task could starve the
+                # dev worker (observed: 29-minute delay on PTD-40 dev dispatch
+                # while 5 PM orphans held the global slot).
                 active = conn.execute(
                     """
                     SELECT COUNT(DISTINCT ticket_id) AS n
-                    FROM (
-                        SELECT ticket_id
-                        FROM locks
-                        WHERE locked_at > ?
-                        UNION
-                        SELECT ticket_id
-                        FROM agent_tasks
-                        WHERE state = 'running'
-                          AND started_at IS NOT NULL
-                          AND started_at > ?
-                    )
+                    FROM agent_tasks
+                    WHERE role = ?
+                      AND state = 'running'
+                      AND started_at IS NOT NULL
+                      AND started_at > ?
                     """,
-                    (cutoff, cutoff),
+                    (role, cutoff),
                 ).fetchone()
                 if int((active or {"n": 0})["n"]) >= max_active_tickets:
                     conn.execute("ROLLBACK")
