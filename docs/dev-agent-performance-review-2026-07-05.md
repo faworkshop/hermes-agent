@@ -159,6 +159,64 @@ rule is consistently applied.
 - **FAW-57 at 29m** — longest *successful* run, from May pre-timeout-fix,
   hit its 1740s runtime organically. Not a current concern.
 
+## PTD-39 contrast case — verify-and-promote path is already efficient
+
+PTD-39 dev session (`Developer_1783250688_2feb8c`) ran **1m32s**, finished
+cleanly with PR #34 promoted to ready-for-review. It is the canonical
+"good pattern" dev task and validates that the TEST-BATCHING RULE is
+correctly targeted at fresh-implementation over-iteration, NOT at
+verify-and-promote tasks.
+
+### PTD-38 vs PTD-39 at a glance
+
+| factor              | PTD-38 (slow)         | PTD-39 (fast)             |
+|---------------------|-----------------------|---------------------------|
+| task type           | implement + test + push | verify existing PR + promote |
+| code writes         | 3 model files + refactor | 0 file edits            |
+| `mvnw` invocations  | 20                    | 4 (2 actual + 2 cwd fixes) |
+| messages            | 308                   | 38                        |
+| duration            | 20m45s                | 1m32s                     |
+| test pattern        | over-iterated single-class + full | single targeted check |
+
+### PTD-39 actual flow (38 messages, 22 tool calls)
+
+1. Read ticket + comments (linear_read_ticket, linear_read_comments)
+2. Fetched PR #34 state (github_get_pr, github_get_pr_checks)
+3. Checked git status / branch / log
+4. Ran `mvnw test -Dtest=EtaServiceTest` ONCE to validate the existing
+   implementation (msg 13)
+5. Hit a directory-not-found error (cwd was `apps/backend`, mvnw wrapper
+   not there — msg 24 corrected to repo root)
+6. Inspected CI status (`curl ... actions/runs/...`)
+7. Marked PR ready-for-review (github_update_pr)
+8. Posted Linear comment + status update (linear_post_comment,
+   linear_update_status as LAST action)
+
+This is exactly the pattern the TEST-BATCHING RULE encourages:
+**single targeted test run, no over-iteration, surgical verification**.
+
+### What this tells us about the TEST-BATCHING RULE
+
+✅ **The rule is well-targeted.** PTD-38 is the canonical "bad" pattern
+(over-iteration during fresh implementation). PTD-39 is the canonical
+"good" pattern (surgical verification, minimal test runs).
+
+✅ **The dev agent already does the right thing on verify tasks.** No
+rule needed for that case.
+
+⚠️ **The risk is fresh implementation tasks where the agent has time
+pressure to "show progress" by running tests.** PTD-38 is the prototype.
+Need ~20 more dev runs post-deploy to confirm the rule actually changes
+behavior on fresh implementation tasks.
+
+### Caveat: PTD-39 review-time reporting
+
+The original perf review noted *"PTD-39 was running 10m52s at review
+time"*. That number was based on a stale read — task 899 (a separate
+orphan task row) had already been reaped/deleted by the webhook server
+restart between when it was queued and when the review ran. Only one
+PTD-39 dev task exists in the database (id 918, 1m32s duration, done).
+
 ## What this means
 
 ✅ Dev agent throughput is **~13 tickets/day at peak** (Jul 3 was 31 runs in
