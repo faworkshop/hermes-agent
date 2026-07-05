@@ -131,6 +131,27 @@ pipeline:
         - Frontend: `cd apps/frontend && pnpm run lint && pnpm run type-check && pnpm run test:ci`
         - NEVER push with failing or unverified tests. The sequence is always:
           write code → run tests locally → all pass → git push → verify CI.
+      TEST-BATCHING RULE (mandatory, learned from PTD-38 timing analysis):
+        - Each `./mvnw test` invocation costs ~30-60s of JVM + Quarkus boot overhead,
+          even with `-q` or single-test filters. Re-running tests after every small
+          edit is the single largest time sink in dev sessions — observed: PTD-38
+          (20m45s total) spent ~10-15m on JVM boot across 20 test invocations.
+        - Run tests ONCE at the end after all edits are complete, NOT after each edit.
+        - During implementation, rely on the compiler (`./mvnw compile -q`,
+          `mvn -DskipTests test-compile`) to catch syntax / type errors as you go.
+          The compiler is fast (<5s) and catches ~95% of edit-time mistakes.
+        - Use single-test-class invocations (`./mvnw -Dtest=ClassName test`) ONLY
+          to debug a SPECIFIC failing test — never as a routine "did my edit work" check.
+        - Full suite (`./mvnw test`) is run exactly twice per session:
+          (1) once after all code edits are complete, before `git commit`
+          (2) once before `git push` to confirm no regressions from the commit.
+        - For Quarkus dev iteration, prefer `./mvnw -DskipITs test` (skips
+          integration tests with Quarkus boot) when you only need fast unit-test feedback.
+          Reserve full `./mvnw test` for the pre-push gate.
+        - Frontend equivalent: do NOT re-run `pnpm run test:ci` after every file
+          save. Use `pnpm exec jest --watch` or `pnpm exec jest <file>` for targeted
+          runs during dev; run the full CI triple (lint + type-check + test:ci)
+          exactly once before `git push`.
       CI/Jest OOM RULE (mandatory):
         - If test runs or CI logs show any Node/Jest memory signal, treat it as a required fix, not a flaky rerun:
           `JavaScript heap out of memory`, `FATAL ERROR: Ineffective mark-compacts near heap limit`,
