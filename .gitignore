@@ -62,3 +62,11 @@ mini-swe-agent/
 .direnv/
 result
 website/static/api/skills-index.json
+
+# FAW Workshop — legacy SQLite queue files (pre-Jul 5 2026 PG migration).
+# ConcurrencyManager no longer reads these; safe to delete from disk.
+agent_state.db
+agent_state.db-shm
+agent_state.db-wal
+webhook_server.db
+compose.postgres.env.local
