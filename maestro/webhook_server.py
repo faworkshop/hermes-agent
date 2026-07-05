@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import asyncio
-import sqlite3
 import time
 import uuid
 import requests
@@ -17,7 +16,7 @@ load_dotenv(Path.home() / ".hermes" / ".env")
 
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 
 from fastapi import FastAPI, Request, HTTPException, Query
 
@@ -59,97 +58,77 @@ if not logger.handlers:
     logger.addHandler(_file)
 
 app = FastAPI(title="Hermes Webhook Server")
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+cm = ConcurrencyManager()
 
 
-def _resolve_webhook_agent_db_path() -> str:
-    """Resolve agent queue SQLite path for this process.
-
-    Relative ``HERMES_AGENT_STATE_DB`` values are anchored to the **repository root**
-    (parent of ``maestro/``), not ``os.getcwd()``, so launchd/systemd/docker with a
-    surprising cwd still opens the same file as local development.
-
-    Ensures the parent directory exists so SQLite can create ``.db-wal`` / ``.db-shm``.
-    """
-    raw = (os.getenv("HERMES_AGENT_STATE_DB") or "").strip()
-    if raw:
-        p = Path(raw).expanduser()
-        if not p.is_absolute():
-            p = _REPO_ROOT / p
-    else:
-        p = _REPO_ROOT / "agent_state.db"
-    p = p.resolve(strict=False)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return str(p)
-
-
-_AGENT_DB_PATH = _resolve_webhook_agent_db_path()
-cm = ConcurrencyManager(db_path=_AGENT_DB_PATH)
-
-
-def _resolved_agent_db_path() -> str:
-    """Absolute path used for logs and SQLite probes (matches operator expectations)."""
-    try:
-        return str(Path(cm.db_path).expanduser().resolve())
-    except Exception:
-        return str(Path(cm.db_path).expanduser())
-
-
-def _log_agent_state_db_at_startup() -> None:
-    """Log queue DB path, directory permissions, and a trivial SQLite probe."""
-    resolved = _resolved_agent_db_path()
-    parent = Path(resolved).parent
+def _log_queue_backend_at_startup() -> None:
+    """Log that the agent queue uses PostgreSQL (``FAW_DB_URL``)."""
     logger.info(
-        "Agent queue DB: raw=%r resolved=%r env.HERMES_AGENT_STATE_DB=%r",
-        cm.db_path,
-        resolved,
-        os.getenv("HERMES_AGENT_STATE_DB"),
-    )
-    logger.info(
-        "Agent queue DB parent: %r is_dir=%s access[RWX]=%s/%s/%s",
-        str(parent),
-        parent.is_dir(),
-        os.access(parent, os.R_OK),
-        os.access(parent, os.W_OK),
-        os.access(parent, os.X_OK),
+        "Agent queue backend: PostgreSQL (FAW_DB_URL is set; credentials not logged)."
     )
     try:
-        with sqlite3.connect(resolved, timeout=5.0, isolation_level=None) as conn:
-            conn.execute("SELECT 1").fetchone()
-        logger.info("Agent queue DB probe: sqlite connect + SELECT 1 OK")
-    except sqlite3.Error as exc:
-        logger.error(
-            "Agent queue DB probe FAILED (queue workers will fail until fixed): %s",
-            exc,
-            exc_info=True,
+        snap = cm.queue_debug_snapshot()
+        logger.info(
+            "Agent queue DB snapshot: database=%r agent_tasks_count=%s max_id=%s pg_is_in_recovery=%s",
+            snap.get("current_database"),
+            snap.get("agent_tasks_count"),
+            snap.get("agent_tasks_max_id"),
+            snap.get("pg_is_in_recovery"),
         )
+    except Exception as exc:
+        logger.warning("Agent queue DB snapshot failed: %s", exc, exc_info=True)
 
 
-def _sqlite_queue_error_note(exc: BaseException) -> str:
-    """Extra context for sqlite3.OperationalError (e.g. unable to open database file)."""
-    if not isinstance(exc, sqlite3.OperationalError):
+def _normalize_linear_ticket_id(raw: object) -> str | None:
+    """Normalize Linear ``identifier`` (e.g. strip, unify unicode hyphens)."""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    for bad, good in (
+        ("\u2011", "-"),  # NON-BREAKING HYPHEN
+        ("\u2010", "-"),  # HYPHEN
+        ("\u2212", "-"),  # MINUS SIGN
+    ):
+        s = s.replace(bad, good)
+    s = " ".join(s.split())
+    return s or None
+
+
+def _pg_queue_error_note(exc: BaseException) -> str:
+    """Extra context for psycopg2 errors in queue workers."""
+    mod = getattr(type(exc), "__module__", "") or ""
+    if "psycopg2" not in mod:
         return ""
-    try:
-        resolved = _resolved_agent_db_path()
-    except Exception:
-        resolved = cm.db_path
-    return (
-        " SQLite_context"
-        f" path={cm.db_path!r} resolved={resolved!r}"
-        f" HERMES_AGENT_STATE_DB={os.getenv('HERMES_AGENT_STATE_DB')!r}"
-        f" cwd={os.getcwd()!r}"
-    )
+    return f" pg_context type={type(exc).__name__} cwd={os.getcwd()!r}"
 
 
 _worker_tasks: dict[str, asyncio.Task] = {}
 _ci_poll_task: asyncio.Task | None = None
 _pm_scanner_task: asyncio.Task | None = None
+_watchdog_task: asyncio.Task | None = None
 _worker_stop_event = asyncio.Event()
 _STALE_RUNNING_SECONDS = float(os.getenv("HERMES_QUEUE_STALE_RUNNING_SECONDS", "1800"))
+# Watch-dog: aggressively reaps stuck tasks based on heartbeat staleness.
+# Runs independently of agent workers so a frozen worker still gets cleaned.
+# Default 60s poll × 900s (15min) stale threshold = ~15min max zombie lifetime.
+_WATCHDOG_POLL_SECONDS = float(os.getenv("HERMES_WATCHDOG_POLL_SECONDS", "60"))
+_WATCHDOG_STALE_SECONDS = float(os.getenv("HERMES_WATCHDOG_STALE_SECONDS", "900"))
 _MAX_ACTIVE_TICKETS = int(os.getenv("HERMES_MAX_ACTIVE_TICKETS", "1"))
+# PM triage is cheap (12-90s) and must not be starved by dev/reviewer/qa runs that
+# hold the single global slot. Product Manager runs against its own counter so
+# scanning can proceed concurrently with active implementation/verification work.
+_MAX_ACTIVE_PM_TICKETS = int(os.getenv("HERMES_MAX_ACTIVE_PM_TICKETS", "5"))
 _PM_SCANNER_ENABLED = os.getenv("PM_SCANNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 _PM_SCANNER_INTERVAL_SECONDS = float(os.getenv("PM_SCANNER_INTERVAL_SECONDS", "900"))
 _PM_SCANNER_LIMIT = int(os.getenv("PM_SCANNER_LIMIT", "50"))
+# Skip re-firing PM on a ticket whose most recent PM run completed within
+# the last N seconds. Prevents wasteful re-triage loops on tickets where the
+# PM has already triaged and intentionally left the ticket in a no-progress
+# state (e.g. blocked on upstream dependencies). Override with env if needed.
+_PM_SCANNER_COOLDOWN_SECONDS = float(os.getenv("PM_SCANNER_COOLDOWN_SECONDS", "7200"))
 
 LINEAR_WEBHOOK_SECRET=os.getenv("LINEAR_WEBHOOK_SECRET") or os.getenv("LINEAR_HMAC_SECRET")
 LINEAR_BOT_USER_ID = os.getenv("LINEAR_BOT_USER_ID")
@@ -227,6 +206,174 @@ _PM_INTAKE_STATES = {
     for k, v in _STATE_AGENT_MAPPING_RAW.items()
     if v == "Product Manager"
 }
+
+
+# ── Unblock trigger ─────────────────────────────────────────────────────
+# When a ticket transitions to a state where its work is "landed"
+# (Ready For Delivery / Approved For Delivery / Done), find any tickets
+# that had this ticket as a blocker and re-enqueue PM for them so the
+# dev agent queue doesn't idle waiting for the next scanner cycle.
+_UNBLOCK_TRIGGER_STATES = {
+    _normalize_linear_state_name("Ready For Delivery"),
+    _normalize_linear_state_name("Approved For Delivery"),
+    _normalize_linear_state_name("Done"),
+}
+
+# Hold strong references to background asyncio.Tasks so they are not
+# garbage-collected before the event loop gets to schedule them.
+# Without this, ``asyncio.create_task(_trigger_unblock_pm(...))`` from
+# the sync webhook handler would log "scheduled" and then be dropped
+# silently before the coroutine ever executes — this is a documented
+# asyncio footgun. We add on create and remove on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_background_task(coro) -> asyncio.Task:
+    """Create an asyncio Task and retain a strong reference until it finishes.
+
+    Use this for fire-and-forget background work scheduled from sync code
+    paths (or async handlers that return immediately afterwards). Without
+    holding the reference, the task can be garbage-collected before it
+    runs, and the coroutine body never executes.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _find_dependent_tickets(blocker_id: str) -> list[dict[str, Any]]:
+    """Return Linear issues that the given blocker is blocking.
+
+    Walks the blocker's outgoing ``relations`` (this issue is the source of
+    the relation) and filters to ``type="blocks"`` to find tickets that
+    list this issue as a blocker. Returns a list of issue dicts with at
+    least ``id``, ``identifier``, ``state``, ``labels``.
+
+    Note: in Linear's data model, ``issue.relations`` lists relations where
+    THIS issue is the source (i.e. tickets that this issue points to).
+    So when PTD-38 has ``blocks → PTD-39``, that means PTD-38 blocks PTD-39,
+    and PTD-39 is a dependent of PTD-38.
+    """
+    query = """
+    query FindDependents($blockerId: String!) {
+      issue(id: $blockerId) {
+        relations(first: 50) {
+          nodes {
+            type
+            relatedIssue {
+              id
+              identifier
+              state { name }
+              labels(first: 25) { nodes { name } }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = _linear_gql(query, {"blockerId": blocker_id})
+    issue = (data or {}).get("issue") or {}
+    rels = (issue.get("relations") or {}).get("nodes") or []
+    dependents: list[dict[str, Any]] = []
+    for rel in rels:
+        if rel.get("type") != "blocks":
+            continue
+        dep = rel.get("relatedIssue") or {}
+        if dep.get("identifier"):
+            dependents.append(dep)
+    return dependents
+
+
+async def _trigger_unblock_pm(blocker_ticket_id: str, blocker_uuid: str) -> int:
+    """Find tickets blocked by ``blocker_ticket_id`` and enqueue PM for each.
+
+    Returns the count of PM tasks newly enqueued. Each enqueue uses a
+    distinct dedup_key so it does not collide with the regular PM scanner
+    and so a duplicate webhook does not create a duplicate PM run.
+    """
+    if not blocker_uuid:
+        logger.warning(
+            "Unblock trigger: no UUID for blocker=%s — skipping dependent lookup",
+            blocker_ticket_id,
+        )
+        return 0
+    try:
+        dependents = _find_dependent_tickets(blocker_uuid)
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("Unblock trigger: dependent lookup failed: %s", exc)
+        return 0
+    if not dependents:
+        logger.info(
+            "Unblock trigger: no dependents found for blocker=%s", blocker_ticket_id
+        )
+        return 0
+
+    queued = 0
+    unblock_ts = int(time.time())
+    for dep in dependents:
+        dep_id = (dep.get("identifier") or "").strip()
+        if not dep_id:
+            continue
+        # Only act on tickets still in PM intake states (Todo/Backlog/Triage/New).
+        # Tickets already In Progress / In Review / Done are not blocked-on-us.
+        dep_state = ((dep.get("state") or {}).get("name") or "").strip()
+        if _normalize_linear_state_name(dep_state) not in _PM_INTAKE_STATES:
+            logger.debug(
+                "Unblock trigger: skipping %s (state=%s is not PM intake)",
+                dep_id, dep_state,
+            )
+            continue
+        # Skip if the dependent already has needs-human (operator escalation pending)
+        labels = (dep.get("labels") or {}).get("nodes") or []
+        if any(
+            ((lbl.get("name") or "").strip().casefold() == "needs-human")
+            for lbl in labels
+        ):
+            logger.debug(
+                "Unblock trigger: skipping %s (has needs-human label)", dep_id
+            )
+            continue
+        # Skip if a recent PM run already touched this ticket within the cooldown
+        # window — avoids double-firing with the regular scanner cycle.
+        last_done = cm.last_completed_task_for_role(
+            dep_id, "Product Manager",
+            max_age_seconds=_PM_SCANNER_COOLDOWN_SECONDS,
+        )
+        if last_done is not None:
+            logger.debug(
+                "Unblock trigger: skipping %s (PM cooldown active, last run task_id=%s)",
+                dep_id, last_done["id"],
+            )
+            continue
+
+        prompt = (
+            f"Ticket {dep_id} just had its blocker {blocker_ticket_id} ship to "
+            f"Ready For Delivery (or further). Re-triage {dep_id} NOW — if it has "
+            f"AI-Ready and no remaining blockers, promote to In Progress so Developer "
+            f"can pick it up without waiting for the next scanner cycle. "
+            f"Do NOT add AI-Ready yourself; that remains human-only."
+        )
+        dedup_key = f"{dep_id}:Product Manager:unblock-{blocker_ticket_id}-{unblock_ts}"
+        try:
+            created, task_row = cm.enqueue_task(
+                dep_id,
+                "Product Manager",
+                prompt,
+                dedup_key=dedup_key,
+                source_state=_normalize_linear_state_name(dep_state),
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("Unblock trigger: enqueue failed for %s: %s", dep_id, exc)
+            continue
+        if created:
+            queued += 1
+            logger.info(
+                "Unblock trigger: queued PM for dependent=%s (blocker=%s) task_id=%s",
+                dep_id, blocker_ticket_id, (task_row or {}).get("id"),
+            )
+    return queued
+
 
 ROLE_TOOLSETS = {
     "Product Manager": ["linear"],
@@ -414,7 +561,7 @@ class AgentTaskRunResult:
     outcome: str  # success | failed | requeued_after_timeout | ci_redirect
     error: Optional[str] = None
 
-    def terminal_error_for_sqlite(self) -> Optional[str]:
+    def terminal_error_for_task(self) -> Optional[str]:
         """Error string to persist on ``agent_tasks.last_error`` (failed runs only)."""
         if self.outcome == "success":
             return None
@@ -429,6 +576,8 @@ class AgentTaskRunResult:
 async def run_agent_task(
     role: str, ticket_id: str, prompt: str, session_id: str = None,
     hard_timeout_seconds: float = None,
+    heartbeat_callback: Optional[Callable[[], None]] = None,
+    heartbeat_interval_seconds: float = 60.0,
 ) -> AgentTaskRunResult:
     if role in ["Developer", "Reviewer", "QA"]:
         retries = cm.get_retry_count(ticket_id)
@@ -475,9 +624,29 @@ async def run_agent_task(
             None,
             lambda: agent.run_conversation(user_message=prompt, system_message=system_message),
         )
+        heartbeat_task: Optional[asyncio.Task] = None
         if hard_timeout_seconds is not None and hard_timeout_seconds > 0:
-            try:
+            if heartbeat_callback is not None and heartbeat_interval_seconds > 0:
+                async def _heartbeat_loop():
+                    while True:
+                        try:
+                            await asyncio.sleep(heartbeat_interval_seconds)
+                            try:
+                                heartbeat_callback()
+                            except Exception as hb_exc:
+                                logger.warning(
+                                    "Heartbeat callback failed for %s/%s: %s",
+                                    role, ticket_id, hb_exc,
+                                )
+                        except asyncio.CancelledError:
+                            return
+                        except Exception:
+                            logger.exception("Unexpected error in heartbeat loop")
+                heartbeat_task = asyncio.create_task(_heartbeat_loop())
+            async def _wait_with_heartbeat():
                 await asyncio.wait_for(future, timeout=hard_timeout_seconds)
+            try:
+                await _wait_with_heartbeat()
             except asyncio.TimeoutError:
                 logger.warning(
                     "Hard timeout reached for %s Agent on %s (%.0fs). "
@@ -522,6 +691,12 @@ async def run_agent_task(
         logger.error(f"Error running {role} Agent for {ticket_id}: {e}")
         return AgentTaskRunResult("failed", f"{type(e).__name__}: {e}")
     finally:
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
         cm.release_lock(ticket_id, role)
     return AgentTaskRunResult("success")
 
@@ -554,10 +729,14 @@ async def _agent_worker(role: str) -> None:
                 )
 
             worker_session_id = f"{role}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            # PM has its own throttle — see _MAX_ACTIVE_PM_TICKETS comment above.
+            effective_max_active = (
+                _MAX_ACTIVE_PM_TICKETS if role == "Product Manager" else _MAX_ACTIVE_TICKETS
+            )
             task = cm.claim_next_task(
                 role,
                 session_id=worker_session_id,
-                max_active_tickets=_MAX_ACTIVE_TICKETS,
+                max_active_tickets=effective_max_active,
                 active_timeout_seconds=_STALE_RUNNING_SECONDS,
             )
             if not task:
@@ -581,6 +760,8 @@ async def _agent_worker(role: str) -> None:
                 run_result = await run_agent_task(
                     role, ticket_id, prompt, session_id=session_id,
                     hard_timeout_seconds=_STALE_RUNNING_SECONDS,
+                    heartbeat_callback=lambda: cm.touch_heartbeat(task_id),
+                    heartbeat_interval_seconds=60.0,
                 )
                 if run_result.outcome == "requeued_after_timeout":
                     logger.info(
@@ -602,7 +783,7 @@ async def _agent_worker(role: str) -> None:
                 elif run_result.outcome == "success":
                     cm.complete_task(task_id, success=True, error=None)
                 else:
-                    err = run_result.terminal_error_for_sqlite() or "Agent run failed"
+                    err = run_result.terminal_error_for_task() or "Agent run failed"
                     cm.complete_task(task_id, success=False, error=err)
                     try:
                         _notify_linear_agent_blocked_on_queue_failure(
@@ -633,7 +814,7 @@ async def _agent_worker(role: str) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            note = _sqlite_queue_error_note(exc)
+            note = _pg_queue_error_note(exc)
             logger.error(
                 "Queue worker loop error for role=%s: %s.%s Backing off and continuing.",
                 role,
@@ -643,6 +824,54 @@ async def _agent_worker(role: str) -> None:
             )
             await asyncio.sleep(1.5)
     logger.info("Stopped queue worker for role=%s", role)
+
+
+async def _watchdog_worker() -> None:
+    """Proactive zombie reaper.
+
+    Runs independently of agent workers (which only call recover_stale when
+    idle/idle-spinning). Polls every HERMES_WATCHDOG_POLL_SECONDS and reaps any
+    'running' task whose heartbeat is stale by HERMES_WATCHDOG_STALE_SECONDS.
+
+    Cuts zombie lifetime from "until the next worker idle-spin" (~hours if a
+    worker is busy) to "watchdog poll × 1" (~60s + 900s = 15min worst case).
+
+    Recovered tasks are returned to 'queued' (not 'failed') so the worker can
+    retry — same behavior as agent_worker.recover_stale_running_tasks.
+    """
+    logger.info(
+        "Starting watchdog worker (poll=%.0fs, stale=%.0fs)",
+        _WATCHDOG_POLL_SECONDS, _WATCHDOG_STALE_SECONDS,
+    )
+    while not _worker_stop_event.is_set():
+        try:
+            # Run recovery for ALL roles in one shot (no role filter)
+            recovered = cm.recover_stale_running_tasks(
+                role=None,
+                stale_after_seconds=_WATCHDOG_STALE_SECONDS,
+                requeue_delay_seconds=2.0,  # small delay to avoid hot-loop on same task
+            )
+            if recovered:
+                logger.warning(
+                    "Watchdog recovered %d stale running task(s) (stale_after=%.0fs)",
+                    recovered, _WATCHDOG_STALE_SECONDS,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Watchdog loop error: %s", exc, exc_info=True)
+
+        try:
+            await asyncio.wait_for(
+                _worker_stop_event.wait(),
+                timeout=_WATCHDOG_POLL_SECONDS,
+            )
+            # stop event set → exit loop
+            break
+        except asyncio.TimeoutError:
+            # normal: poll again
+            continue
+    logger.info("Stopped watchdog worker")
 
 
 def _github_headers() -> Dict[str, str]:
@@ -660,9 +889,9 @@ def _resolve_repo_owner_repo(pr_info: Dict[str, Any] = None, data: Dict[str, Any
             return tuple(repo_url.split("/", 1))
 
     # Fallback: query GitHub for the repo associated with the Linear team's GitHub label
-    # or just use the env-known repo (faworkshop/true-review)
+    # or just use the env-known repo (faworkshop/ptdashboard)
     return (os.getenv("GITHUB_REPO_OWNER", "faworkshop"),
-            os.getenv("GITHUB_REPO_NAME", "true-review"))
+            os.getenv("GITHUB_REPO_NAME", "ptdashboard"))
 
 
 def _find_pr_by_branch(branch: str) -> Dict[str, Any]:
@@ -730,10 +959,39 @@ def _github_get(fpath: str) -> Dict[str, Any]:
 
 
 def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
-    """Poll GitHub for CI status on a PR. Returns dict with 'runs' and 'all_passed'."""
+    """Poll GitHub for CI status on a PR.
+
+    Returns a dict with three top-level CI-state keys so the poller can
+    distinguish a still-running check from a real failure:
+
+    * ``status``      - one of ``"passed"``, ``"failed"``, ``"pending"``,
+                        ``"no_runs"`` (no check runs reported yet), or
+                        ``"error"`` (could not read from GitHub).
+    * ``all_passed``  - **back-compat** boolean: ``True`` iff every
+                        completed check has a passing conclusion. Kept so
+                        older callers that only know the two-state result
+                        keep working; new callers should branch on
+                        ``status`` directly. ``None`` when the CI status
+                        is ``pending`` (semantic difference: the run is
+                        still in-flight, NOT a failure).
+    * ``runs``        - raw check-runs list from GitHub.
+    * ``branch``      - head branch ref.
+
+    The legacy two-state collapse (``False`` for both ``failed`` and
+    ``pending``) was the root cause of spurious "CI failed" dispatches
+    whenever the poll fired while a check was still in
+    ``queued``/``in_progress`` status. The fetch
+    ``c.get("conclusion")`` is ``None`` mid-run, which used to make
+    ``all_passed`` ``False`` and trigger the developer-failure path.
+    """
     data = _github_get(f"/repos/{owner}/{repo}/pulls/{pr_number}")
     if not data:
-        return {"runs": [], "all_passed": False, "error": "no response"}
+        return {
+            "runs": [],
+            "all_passed": None,
+            "status": "error",
+            "error": "no response",
+        }
 
     head_sha = data.get("head", {}).get("sha", "")
     branch = data.get("head", {}).get("ref", "")
@@ -741,16 +999,53 @@ def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
     # Get check runs for the head SHA
     check_data = _github_get(f"/repos/{owner}/{repo}/commits/{head_sha}/check-runs")
     if not check_data:
-        return {"runs": [], "all_passed": False, "error": "no check runs", "branch": branch}
+        return {
+            "runs": [],
+            "all_passed": None,
+            "status": "error",
+            "error": "no check runs",
+            "branch": branch,
+        }
 
     runs = check_data.get("check_runs", []) or []
-    conclusions = [r.get("conclusion") for r in runs]
-    all_passed = (
-        len(runs) > 0
-        and all(c in ("success", "skipped", "neutral") for c in conclusions)
+    if not runs:
+        return {"runs": [], "all_passed": None, "status": "no_runs", "branch": branch}
+
+    # Tally per-run state. GitHub sets ``status`` to ``queued`` /
+    # ``in_progress`` while the run is live (conclusion is ``None``);
+    # and ``completed`` once the run has a real ``conclusion``
+    # (``success``, ``failure``, ``cancelled``, ``timed_out``, ``skipped``,
+    # ``neutral``, etc.). We must NOT treat a live run as a failure.
+    pending = any(r.get("status") in ("queued", "in_progress", "waiting",
+                                      "pending", "requested")
+                  for r in runs)
+    failed = any(
+        r.get("status") == "completed"
+        and r.get("conclusion") not in ("success", "skipped", "neutral")
+        for r in runs
     )
 
-    return {"runs": runs, "all_passed": all_passed, "branch": branch}
+    if pending and not failed:
+        # Every still-running check is good news for now — keep polling,
+        # but do NOT push a developer fix (root-cause was a premature
+        # ``all_passed=False`` here).
+        return {"runs": runs, "all_passed": None, "status": "pending", "branch": branch}
+    if failed:
+        failed_names = [
+            r.get("name", "?") for r in runs
+            if r.get("status") == "completed"
+            and r.get("conclusion") not in ("success", "skipped", "neutral")
+        ]
+        return {
+            "runs": runs,
+            "all_passed": False,
+            "status": "failed",
+            "failed_names": failed_names,
+            "branch": branch,
+        }
+
+    # All runs completed with passing conclusions.
+    return {"runs": runs, "all_passed": True, "status": "passed", "branch": branch}
 
 
 async def _ci_poll_worker() -> None:
@@ -802,15 +1097,17 @@ async def _ci_poll_worker() -> None:
                         continue
 
                     ci = _get_ci_status_for_pr(owner, repo, pr_number)
+                    ci_status = ci.get("status")
                     logger.info(
-                        "CI poll %s: %d runs, all_passed=%s (elapsed=%.0fs)",
+                        "CI poll %s: status=%s all_passed=%s runs=%d (elapsed=%.0fs)",
                         ticket_id,
-                        len(ci.get("runs", [])),
+                        ci_status,
                         ci.get("all_passed"),
+                        len(ci.get("runs", [])),
                         elapsed,
                     )
 
-                    if ci.get("all_passed") is True:
+                    if ci_status == "passed":
                         state_id = info.get("in_progress_state_id")
                         if state_id:
                             _move_linear_ticket_state(ticket_id, state_id)
@@ -821,13 +1118,14 @@ async def _ci_poll_worker() -> None:
                             f"ticket moved to In Progress.",
                         )
                         expired.append(ticket_id)
-                    elif ci.get("all_passed") is False:
+                    elif ci_status == "failed":
                         # CI failed — move ticket back to In Progress and enqueue
                         # Developer for follow-up. Keep polling so we catch the
                         # re-run when Developer pushes a fix; don't expire yet.
-                        failed_names = [
-                            r["name"] for r in ci.get("runs", [])
-                            if r.get("conclusion") == "failure"
+                        failed_names = ci.get("failed_names") or [
+                            r.get("name", "?") for r in ci.get("runs", [])
+                            if r.get("status") == "completed"
+                            and r.get("conclusion") not in ("success", "skipped", "neutral")
                         ]
                         logger.warning(
                             "CI FAILED for %s — moving back to In Progress, enqueuing Developer",
@@ -858,6 +1156,7 @@ async def _ci_poll_worker() -> None:
                             dedup_key=dedup_key,
                             source_state="in progress",
                         )
+
                         if created:
                             logger.info(
                                 "CI failure enqueued Developer for %s (new commit will trigger fresh CI)",
@@ -870,13 +1169,29 @@ async def _ci_poll_worker() -> None:
                             )
                         # Do NOT expire — keep polling so we catch CI re-run after Developer pushes.
                         # The ticket stays in CI in Progress in Linear while Developer works.
-
+                    elif ci_status == "pending":
+                        # CI check is still running (``queued`` / ``in_progress``).
+                        # Historically this was mis-classified as ``False`` (the
+                        # legacy ``all_passed`` shape) and the developer was
+                        # spuriously dispatched. Keep polling and wait.
+                        logger.debug(
+                            "CI poll %s: still pending — keeping poll, no action",
+                            ticket_id,
+                        )
+                    else:
+                        # ``no_runs`` / ``error`` — nothing to act on yet, just
+                        # continue polling until GitHub reports the check.
+                        logger.debug(
+                            "CI poll %s: no conclusion yet (status=%s) — keeping poll",
+                            ticket_id,
+                            ci_status,
+                        )
                 for tid in expired:
                     _ci_polling_tickets.pop(tid, None)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            note = _sqlite_queue_error_note(exc)
+            note = _pg_queue_error_note(exc)
             logger.error("CI poll worker loop error: %s%s", exc, note, exc_info=True)
             await asyncio.sleep(2.0)
 
@@ -917,6 +1232,25 @@ async def _pm_intake_scanner_worker() -> None:
                 if has_needs_human:
                     logger.debug("PM scanner skipping %s — has needs-human label", ticket_id)
                     continue
+                # Cooldown: avoid re-firing PM on a ticket whose last PM run
+                # is still recent (e.g. blocked-on-deps tickets intentionally
+                # left in Todo by an earlier PM triage). Without this guard,
+                # every scanner cycle would re-enqueue the same ticket
+                # indefinitely, wasting tokens and spamming the queue.
+                last_done = cm.last_completed_task_for_role(
+                    ticket_id, "Product Manager",
+                    max_age_seconds=_PM_SCANNER_COOLDOWN_SECONDS,
+                )
+                if last_done is not None:
+                    age = int(time.time() - float(last_done["finished_at"]))
+                    logger.debug(
+                        "PM scanner skipping %s — last PM run finished %ds ago "
+                        "(task_id=%s, state=%s, err=%s). Cooldown=%ds.",
+                        ticket_id, age, last_done["id"], last_done["state"],
+                        (last_done.get("last_error") or "")[:80],
+                        _PM_SCANNER_COOLDOWN_SECONDS,
+                    )
+                    continue
                 prompt = (
                     f"Ticket {ticket_id} is currently in '{state_name}' "
                     f"and {'has' if has_ai_ready else 'does not have'} AI-Ready. "
@@ -945,7 +1279,7 @@ async def _pm_intake_scanner_worker() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            note = _sqlite_queue_error_note(exc)
+            note = _pg_queue_error_note(exc)
             logger.error("PM intake scanner loop error: %s%s", exc, note, exc_info=True)
             await asyncio.sleep(2.0)
 
@@ -1266,13 +1600,56 @@ def _redirect_to_ci_in_progress(
     )
 
 
+def _post_pr_draft_blocked_comment(ticket_id: str, pr_number: int) -> None:
+    """Post a Linear comment explaining why Reviewer dispatch was blocked.
+
+    Triggered when a Developer agent moves a ticket to 'In Review' but the
+    associated GitHub PR is still a draft. The right fix is to mark the PR
+    ready for review (or close the draft) — until then the ticket cannot
+    advance to the Reviewer stage.
+    """
+    body = (
+        f"⚠️ **Reviewer dispatch blocked** — "
+        f"the ticket was moved to 'In Review' but the associated "
+        f"[PR #{pr_number}]({_resolve_repo_owner_repo()[0]}/{_resolve_repo_owner_repo()[1]}/pull/{pr_number}) "
+        f"is still a **Draft**.\n\n"
+        f"\n\n"
+        f"### What to do\n\n"
+        f"- Review the diff and the CI status on the PR\n"
+        f"- When the work is ready, mark the PR *Ready for review* "
+        f"(`gh pr ready {pr_number}`) — the next event will re-dispatch Reviewer\n"
+        f"- Or close the draft PR if the work isn't ready yet — and move this ticket back to 'In Progress'\n\n"
+        f"### Why this happens\n\n"
+        f"The pipeline gates Reviewer dispatch on `isDraft == false` so reviewers "
+        f"don't get pinged on work-in-progress branches. A draft PR means the work "
+        f"isn't yet ready for human/code review, so the ticket stays in its current state."
+    )
+    try:
+        _post_linear_comment(ticket_id, body)
+        logger.info(
+            "Posted draft-blocked comment on %s (PR #%d)",
+            ticket_id, pr_number,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to post draft-blocked comment on %s: %s",
+            ticket_id, exc,
+        )
+
+
 def _get_ci_in_progress_state_id(ticket_id: str) -> str | None:
-    """Resolve the Linear state id for 'CI in Progress'."""
+    """Resolve the Linear state id for 'CI in Progress'.
+
+    Note: Linear's WorkflowStateFilter only supports a singular ``name``
+    StringComparator — there is no plural ``names`` filter. We fetch all
+    of the team's states and casefold-match locally, which also tolerates
+    casing variants like 'CI in Progress' / 'CI In Progress'.
+    """
     query = """
     query GetStates($id: String!) {
       issue(id: $id) {
         team {
-          states(filter: {names: ["CI in Progress", "CI in progress"]}) {
+          states {
             nodes { id name }
           }
         }
@@ -1292,8 +1669,8 @@ def _get_ci_in_progress_state_id(ticket_id: str) -> str | None:
 
 @app.on_event("startup")
 async def _startup_workers() -> None:
-    global _ci_poll_task, _pm_scanner_task
-    _log_agent_state_db_at_startup()
+    global _ci_poll_task, _pm_scanner_task, _watchdog_task
+    _log_queue_backend_at_startup()
     _worker_stop_event.clear()
     for role in _queue_roles():
         if role in _worker_tasks and not _worker_tasks[role].done():
@@ -1303,17 +1680,21 @@ async def _startup_workers() -> None:
         _ci_poll_task = asyncio.create_task(_ci_poll_worker())
     if _pm_scanner_task is None or _pm_scanner_task.done():
         _pm_scanner_task = asyncio.create_task(_pm_intake_scanner_worker())
+    if _watchdog_task is None or _watchdog_task.done():
+        _watchdog_task = asyncio.create_task(_watchdog_worker())
 
 
 @app.on_event("shutdown")
 async def _shutdown_workers() -> None:
-    global _ci_poll_task, _pm_scanner_task
+    global _ci_poll_task, _pm_scanner_task, _watchdog_task
     _worker_stop_event.set()
     tasks = [t for t in _worker_tasks.values() if not t.done()]
     if _ci_poll_task and not _ci_poll_task.done():
         tasks.append(_ci_poll_task)
     if _pm_scanner_task and not _pm_scanner_task.done():
         tasks.append(_pm_scanner_task)
+    if _watchdog_task and not _watchdog_task.done():
+        tasks.append(_watchdog_task)
     for task in tasks:
         task.cancel()
     if tasks:
@@ -1321,6 +1702,7 @@ async def _shutdown_workers() -> None:
     _worker_tasks.clear()
     _ci_poll_task = None
     _pm_scanner_task = None
+    _watchdog_task = None
 
 
 def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
@@ -1346,7 +1728,7 @@ async def linear_webhook(request: Request):
     action = payload.get("action")
     data = payload.get("data", {}) or {}
     type_ = payload.get("type")
-    ticket_id = data.get("identifier") if isinstance(data, dict) else None
+    ticket_id = _normalize_linear_ticket_id(data.get("identifier") if isinstance(data, dict) else None)
     state_name = (data.get("state") or {}).get("name") if isinstance(data.get("state"), dict) else None
 
     logger.info(
@@ -1387,6 +1769,27 @@ async def linear_webhook(request: Request):
         return _log_ignored("No state on payload and no state change", action=action)
 
     state_key = _normalize_linear_state_name(new_state)
+
+    # ── Unblock trigger: schedule dependent-ticket PM enqueue as a background
+    # task so it runs regardless of the standard dispatch path's early-returns.
+    # Fire only on real transitions (updatedFrom shows a previous state) and only
+    # when entering a "landed" state. We schedule and don't await so the webhook
+    # response stays fast.
+    if state_key in _UNBLOCK_TRIGGER_STATES:
+        updated_from = payload.get("updatedFrom") or {}
+        if isinstance(updated_from, dict) and updated_from.get("stateId"):
+            blocker_uuid = _linear_issue_uuid_for_api(data, ticket_id)
+            if blocker_uuid:
+                logger.info(
+                    "Unblock trigger scheduled: blocker=%s landed in '%s'",
+                    ticket_id, new_state,
+                )
+                # Use the helper instead of raw asyncio.create_task so the
+                # task is held by a strong reference until completion —
+                # otherwise the coroutine is silently GC'd before it runs.
+                _schedule_background_task(
+                    _trigger_unblock_pm(ticket_id, blocker_uuid)
+                )
     role = _STATE_AGENT_BY_NORMALIZED.get(state_key)
     if not role:
         return _log_ignored(
@@ -1462,17 +1865,36 @@ async def linear_webhook(request: Request):
         pr_number = pr_info.get("number") if pr_info else None
         owner, repo = _resolve_repo_owner_repo(pr_info=pr_info if pr_info else None, data=data)
         if pr_number:
-            ci = _get_ci_status_for_pr(owner, repo, pr_number)
-            if not ci.get("all_passed"):
+            # Draft guard: if the PR is still a draft, the agent marked
+            # Linear "In Review" prematurely. Don't dispatch a Reviewer;
+            # leave the ticket alone and post a comment telling the human
+            # (and the developer agent next time it dispatches) what to do.
+            if pr_info.get("draft"):
                 logger.warning(
-                    "CI not passed for %s (PR #%d) — redirecting to 'CI in Progress' "
-                    "instead of dispatching Reviewer. CI state: %s",
-                    ticket_id, pr_number, ci,
+                    "Reviewer dispatch for %s blocked: PR #%d is still a draft. "
+                    "Mark it ready for review (or close the draft) before the "
+                    "ticket can advance to 'In Review'.",
+                    ticket_id, pr_number,
+                )
+                _post_pr_draft_blocked_comment(ticket_id, pr_number)
+                return _log_ignored(
+                    f"Reviewer dispatch skipped: PR #{pr_number} is still a draft (ticket stays in {new_state} until PR is marked ready for review)",
+                    ticket=ticket_id,
+                    state=new_state,
+                    role=role,
+                )
+            ci = _get_ci_status_for_pr(owner, repo, pr_number)
+            ci_status = ci.get("status")
+            if ci_status != "passed":
+                logger.warning(
+                    "CI not passed for %s (PR #%d, status=%s) — redirecting to 'CI in "
+                    "Progress' instead of dispatching Reviewer. CI state: %s",
+                    ticket_id, pr_number, ci_status, ci,
                 )
                 _redirect_to_ci_in_progress(ticket_id, pr_number, owner, repo, branch, data)
                 # The task was never dispatched to an agent — it was redirected to CI polling.
                 # Complete it as success (it did its job: triggered CI monitoring).
-                return AgentTaskRunResult(outcome="ci_redirect")
+                return {"status": "ci_redirect", "ticket": ticket_id, "pr": pr_number}
             else:
                 logger.info(
                     "CI PASSED for %s (PR #%d) — proceeding with Reviewer dispatch.",
@@ -1512,6 +1934,22 @@ async def linear_webhook(request: Request):
             task_id=task_row.get("id") if task_row else None,
         )
 
+    try:
+        snap = cm.queue_debug_snapshot()
+        n = int(snap.get("agent_tasks_count") or 0)
+        if n == 0:
+            logger.error(
+                "Post-enqueue DB visibility FAILED: agent_tasks_count=0 after enqueue "
+                "ticket=%s role=%s reported_task_id=%r — row did not persist for this FAW_DB_URL. "
+                "Confirm primary DB (not a read-only URL), disk space, and redeploy with "
+                "enqueue_task autocommit=False fix.",
+                ticket_id,
+                role,
+                (task_row or {}).get("id"),
+            )
+    except Exception as exc:
+        logger.warning("Post-enqueue snapshot skipped: %s", exc)
+
     logger.info(
         "Linear webhook queued: ticket=%s state=%r -> agent=%s task_id=%s",
         ticket_id,
@@ -1532,16 +1970,44 @@ async def get_agent_queue(
     role: str | None = Query(default=None),
     state: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    terminal_recent: int = Query(
+        default=150,
+        ge=1,
+        le=500,
+        description=(
+            "When role and state are omitted: max recent done/failed/cancelled rows to append "
+            "after all queued+running rows (active tasks always included regardless of id)."
+        ),
+    ),
 ):
-    """List queued/running/completed tasks for queue debugging."""
-    tasks = cm.list_tasks(role=role, state=state, limit=limit)
+    """List queue tasks for debugging.
+
+    With **no** ``role`` / ``state`` filters: returns **all** queued and running rows, then
+    up to ``terminal_recent`` terminal rows — so low-``id`` active tasks are never hidden
+    behind a large history (unlike a plain ``ORDER BY id DESC LIMIT``).
+    With filters: returns up to ``limit`` rows matching the filter (``id`` descending).
+    """
+    if role is None and state is None:
+        tasks = cm.list_tasks_for_dashboard(terminal_recent=terminal_recent)
+        eff_limit = None
+        mode = "dashboard"
+    else:
+        tasks = cm.list_tasks(role=role, state=state, limit=limit)
+        eff_limit = limit
+        mode = "filtered"
     counts: dict[str, int] = {}
     for item in tasks:
         st = str(item.get("state") or "unknown")
         counts[st] = counts.get(st, 0) + 1
     return {
         "status": "ok",
-        "filters": {"role": role, "state": state, "limit": limit},
+        "filters": {
+            "role": role,
+            "state": state,
+            "limit": eff_limit,
+            "mode": mode,
+            "terminal_recent": terminal_recent if mode == "dashboard" else None,
+        },
         "count": len(tasks),
         "counts_in_result": counts,
         "tasks": tasks,
@@ -1555,6 +2021,193 @@ async def get_agent_queue_stats(
     """Get aggregate queue stats and stale-running candidates."""
     stats = cm.get_queue_stats(stale_after_seconds=float(stale_after_seconds))
     return {"status": "ok", **stats}
+
+
+@app.get("/agent-queue/locks")
+async def get_agent_queue_locks():
+    """Fetch all active locks from the ConcurrencyManager."""
+    locks = cm.get_all_locks_with_age()
+    return {
+        "status": "ok",
+        "count": len(locks),
+        "locks": [
+            {
+                "ticket_id": tid,
+                "assignee": assignee,
+                "locked_at": lat,
+                "age_seconds": age,
+            }
+            for tid, assignee, lat, age in locks
+        ],
+    }
+
+
+@app.get("/agent-queue/db-snapshot")
+async def get_agent_queue_db_snapshot():
+    """DB identity + row counts (helps debug ``INSERT`` vs ``SELECT`` mismatches)."""
+    return {"status": "ok", **cm.queue_debug_snapshot()}
+
+
+@app.get("/agent-queue/by-ticket/{ticket_id}")
+async def get_agent_queue_tasks_for_ticket(ticket_id: str, limit: int = Query(default=50, ge=1, le=200)):
+    """All recent queue rows for a ticket identifier (e.g. ``FAW-49``), newest ``id`` first."""
+    tid = _normalize_linear_ticket_id(ticket_id) or ticket_id.strip()
+    tasks = cm.list_tasks_for_ticket_id(tid, limit=limit)
+    return {
+        "status": "ok",
+        "ticket_id": tid,
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+
+
+@app.get("/agent-queue/stuck-summary")
+async def get_stuck_summary(
+    window_hours: int = Query(default=48, ge=1, le=720),
+    stale_after_seconds: int = Query(default=900, ge=30, le=86400),
+):
+    """Taxonomy of stuck/zombie agent tasks.
+
+    Returns counts of failure modes:
+      - currently_stuck: tasks currently 'running' with stale heartbeat (true zombies)
+      - hard_timeouts: failed tasks with 'Hard timeout' error in window
+      - api_hangs: failed tasks with heartbeat-stale error in window (silent API freeze)
+      - bogus_short_passes: 'done' tasks with attempts>=2 AND dur<300s in window
+      - now_running / now_queued: queue counts
+      - by_role_48h: per-role done/failed counts for failure-rate denominator
+    """
+    now = time.time()
+    cutoff_ts = now - window_hours * 3600
+    stale_cutoff = now - stale_after_seconds
+
+    import psycopg2
+    import psycopg2.extras
+
+    with cm._connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute(
+            """
+            SELECT id, role, ticket_id, attempts,
+                   to_timestamp(started_at) AS started,
+                   to_timestamp(last_heartbeat_at) AS last_hb,
+                   EXTRACT(EPOCH FROM (now() - to_timestamp(COALESCE(last_heartbeat_at, started_at))))::int AS idle_s,
+                   COALESCE(left(last_error, 100), '') AS err
+            FROM agent_tasks
+            WHERE state = 'running'
+            ORDER BY started_at
+            """
+        )
+        running_rows = [dict(r) for r in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT id, role, ticket_id, attempts,
+                   EXTRACT(EPOCH FROM (now() - to_timestamp(COALESCE(started_at, EXTRACT(EPOCH FROM now())))))::int AS age_s,
+                   COALESCE(left(last_error, 100), '') AS err
+            FROM agent_tasks
+            WHERE state = 'queued'
+            ORDER BY id
+            """
+        )
+        queued_rows = [dict(r) for r in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT id, role, ticket_id, attempts,
+                   to_timestamp(started_at) AS started,
+                   to_timestamp(last_heartbeat_at) AS last_hb,
+                   EXTRACT(EPOCH FROM (now() - to_timestamp(COALESCE(last_heartbeat_at, started_at))))::int AS idle_s,
+                   COALESCE(left(last_error, 100), '') AS err
+            FROM agent_tasks
+            WHERE state = 'running'
+              AND (
+                last_heartbeat_at IS NULL
+                OR last_heartbeat_at <= %s
+              )
+            ORDER BY started_at
+            """,
+            (stale_cutoff,),
+        )
+        stuck_rows = [dict(r) for r in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT role, state, COUNT(*) AS n
+            FROM agent_tasks
+            WHERE started_at >= %s
+              AND finished_at IS NOT NULL
+            GROUP BY role, state
+            ORDER BY role, state
+            """,
+            (cutoff_ts,),
+        )
+        per_role: dict[str, dict[str, int]] = {}
+        for r in cur.fetchall():
+            per_role.setdefault(str(r["role"]), {})[str(r["state"])] = int(r["n"])
+
+        cur.execute(
+            """
+            SELECT state, COUNT(*) AS n,
+                   COALESCE(ROUND(AVG(finished_at - started_at))::int, 0) AS avg_dur_s
+            FROM agent_tasks
+            WHERE started_at >= %s
+              AND finished_at IS NOT NULL
+            GROUP BY state
+            """,
+            (cutoff_ts,),
+        )
+        state_counts = {str(r["state"]): {"count": int(r["n"]), "avg_dur_s": int(r["avg_dur_s"])} for r in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM agent_tasks
+            WHERE started_at >= %s AND state = 'failed' AND last_error LIKE 'Hard timeout%%'
+            """,
+            (cutoff_ts,),
+        )
+        hard_timeouts = int(cur.fetchone()["n"])
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM agent_tasks
+            WHERE started_at >= %s AND state = 'failed'
+              AND last_error LIKE '%%heartbeat stale%%' AND attempts = 1
+            """,
+            (cutoff_ts,),
+        )
+        api_hangs = int(cur.fetchone()["n"])
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM agent_tasks
+            WHERE started_at >= %s AND state = 'done'
+              AND attempts >= 2 AND (finished_at - started_at) < 300
+            """,
+            (cutoff_ts,),
+        )
+        bogus_short_passes = int(cur.fetchone()["n"])
+
+    return {
+        "status": "ok",
+        "window_hours": window_hours,
+        "stale_after_seconds": stale_after_seconds,
+        "now_running": len(running_rows),
+        "now_queued": len(queued_rows),
+        "currently_stuck": stuck_rows,
+        "currently_stuck_count": len(stuck_rows),
+        "by_state": state_counts,
+        "by_role_48h": per_role,
+        "failure_modes": {
+            "hard_timeouts": hard_timeouts,
+            "api_hangs": api_hangs,
+            "bogus_short_passes": bogus_short_passes,
+        },
+        "watchdog": {
+            "poll_seconds": _WATCHDOG_POLL_SECONDS,
+            "stale_seconds": _WATCHDOG_STALE_SECONDS,
+        },
+    }
 
 
 @app.get("/agent-queue/{task_id}")
