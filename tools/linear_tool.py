@@ -72,6 +72,13 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
     # (b) github_get_pr directly using PR number from attachment URL.
     # NOTE: project.slug does not exist — use project { id name } only.
     # NOTE: attachments.contentType causes 400 — use { id title url } only.
+    # NOTE: inverseRelations and relations are required by PM Step 6b to
+    # evaluate formal Linear `blocks` blockers. Without them, the PM cannot
+    # distinguish "no relations" from "tool didn't return them". Each row
+    # in inverseRelations is a ticket that BLOCKS this one; relations are
+    # tickets this one blocks. `type` is always "blocks" or "related" —
+    # use the field direction (relations vs inverseRelations) as source
+    # of truth for which side is the actor.
     query = """
     query Issue($id: String!) {
       issue(id: $id) {
@@ -116,6 +123,24 @@ def linear_read_ticket(ticket_id: str, task_id: str = None) -> str:
             body
             user { name }
             createdAt
+          }
+        }
+        relations(first: 20) {
+          nodes {
+            type
+            issue {
+              identifier
+              state { name }
+            }
+          }
+        }
+        inverseRelations(first: 20) {
+          nodes {
+            type
+            issue {
+              identifier
+              state { name }
+            }
           }
         }
       }

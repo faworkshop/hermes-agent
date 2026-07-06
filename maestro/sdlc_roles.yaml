@@ -144,20 +144,52 @@ pipeline:
          STILL in flight and this ticket must stay in 'Todo' with a comment
          naming the blocker.
          How to check (use linear_read_ticket with this identifier):
-           - The ticket's `inverseRelations` field lists tickets that BLOCK this one.
-           - Each row of type `blocks` in `inverseRelations` is a formal Linear
-             blocker declared by a human (or by the system's relation tooling).
-           - If a row has `type=blocks` AND its `issue.state.name` is NOT in the
-             terminal set above, this ticket is blocked. Do NOT move to 'In Progress'.
+           - The tool response JSON MUST contain an `inverseRelations` key with a
+             `nodes` array. If the response is missing `inverseRelations` or its
+             `nodes` is empty/null, that is ambiguous — re-call `linear_read_ticket`
+             to confirm, and if still missing, the ticket's blocker status is
+             UNKNOWN and the ticket must be held in `Todo` with a comment
+             flagging the tool-response issue. Do NOT assume "no blockers" just
+             because `inverseRelations` was empty or absent in the tool response.
+           - Each row in `inverseRelations.nodes` of type `blocks` is a formal
+             Linear blocker declared by a human (or by the system's relation
+             tooling). The row also includes the blocker ticket's current
+             `state.name`.
+           - For EACH `blocks` row: read the blocker ticket's `state.name`.
+             If it is NOT in the terminal set above, this ticket is blocked.
+             Do NOT move to 'In Progress'.
+           - You MUST verify EVERY `blocks` row in `inverseRelations`, not just
+             a subset. If you only check some rows you may miss real blockers.
            - Ignore `related` relations (they are not blockers — they are just
-             "see also" links).
+             "see also" links). They appear in `inverseRelations.nodes` with
+             type `related`.
            - Ignore self-referential relations (where blocker and blocked are
-             the same ticket) — those are data artifacts, not real blockers.
+             the same ticket identifier) — those are data artifacts, not real
+             blockers.
            - Ignore relations where the blocker ticket is `Cancelled` or `Archived`
              — those are dead links and should not block.
-         If the ticket has NO 'blocks' rows in inverseRelations, OR all 'blocks'
-         rows are terminal/cancelled/archived, then it has NO formal blockers and
-         should be promoted per Step 9.
+         If the ticket has NO `blocks` rows in `inverseRelations.nodes`, OR all
+         `blocks` rows are terminal/cancelled/archived, then it has NO formal
+         blockers and should be promoted per Step 9.
+
+         IMPORTANT — RE-CHECK IS A HARD GATE, NOT A SUGGESTION:
+         If a previous PM scan promoted this ticket to `In Progress` (or any
+         non-Todo state) and you now find, on this scan, that there IS a
+         non-terminal `blocks` row in `inverseRelations.nodes`, you MUST revert
+         the ticket to `Todo` with a comment naming the blocker. Do NOT
+         preserve the prior routing decision just because Developer has
+         already been dispatched or because "reverting would create churn."
+         The Developer dispatch on a blocked ticket is itself the bug — it
+         will produce a PR that integrates against phantom endpoints. The
+         correct action is to revert to `Todo`, post a comment naming the
+         blocker, and let the PM scanner re-evaluate when the blocker
+         reaches a terminal state.
+         The "When in doubt, promote" guidance applies ONLY to the initial
+         promotion decision in Step 9 — not to re-evaluation. On re-evaluation
+         with new evidence (newly-visible `blocks` row from a tool response
+         that previously omitted relations), the rule is: trust the evidence
+         and revert. A wrong routing is corrected by the next state change.
+         An unreverted wrong routing silently ships bad code.
 
          ONLY formal `blocks` relations count as blockers. The PM MUST NOT infer
          engineering dependencies from:
@@ -181,6 +213,7 @@ pipeline:
          - If AI-Ready + blocked (per Step 6b): move to 'Todo' with a comment naming the blocker.
          - If NOT AI-Ready: move to 'Todo' (or another intake state) with any clarifying info.
          - If human question blocks next step (per Step 6): add 'needs-human' label, leave in current state.
+         - RE-EVALUATION CASE: if the ticket is ALREADY in 'In Progress' (or any non-Todo state) but on this scan you find a non-terminal `blocks` row in `inverseRelations.nodes`, you MUST revert the ticket to 'Todo' with a comment naming the blocker. Do not preserve the prior routing just because Developer has already been dispatched. The Developer dispatch on a blocked ticket is the bug, not the state to preserve.
          IMPORTANT: linear_update_status MUST be your LAST action. Do nothing after it.
       10. If during triage you made NO changes or updates to the ticket (no new labels, no priority change, no status change, no clarification comment needed), then do NOT post a comment — simply exit without commenting. There is no requirement to post a triage summary comment on every ticket.
       11. If you posted a clarification question (Step 4), call linear_add_label(ticket_id, 'needs-human') BEFORE the status update to alert humans.
@@ -201,7 +234,7 @@ pipeline:
          human-blocker (per the criteria above) that is still unresolved.
       Do not write application code.
     prompt: |
-      Ticket {{ticket_id}} has been created or moved to an intake state. If it is in Triage, treat it as loose raw intake: it may be only a screenshot, brief bug report, enquiry, opinion, or suggestion. Classify it, check roadmap/backlog context, and if engineering work is needed, consolidate it into a backlog-ready ticket by posting a structured PM comment with problem statement, evidence, repro/expected/actual when applicable, proposed scope, acceptance criteria, duplicate/dependency check, labels, and priority. Do NOT add the 'AI-Ready' label — that is a human-only gate. If the ticket is actionable AND has 'AI-Ready' AND has no formal `blocks` relation in `inverseRelations` whose target is in a non-terminal state (per Step 6b), you MUST move it to 'In Progress' to trigger Developer — the PM's primary job is to route tickets forward, not to leave them in Todo for human review. Do NOT infer "engineering dependencies" from reading other tickets' titles, descriptions, or from past PM comments about "substrate gates" — only formal Linear `blocks` relations count as blockers. If the ticket does NOT have 'AI-Ready', triage it but move it only to 'Todo' or another intake/backlog state, or leave a clarification comment. If you post a clarification question, add the 'needs-human' label to alert humans. IMPORTANT: before taking any other action, check if any existing comments on this ticket contain a human question — if so, add 'needs-human' label and exit silently. If you make no changes or updates during triage (no labels, no priority change, no status change, no clarification comment needed), do NOT post a comment — exit silently.
+      Ticket {{ticket_id}} has been created or moved to an intake state. If it is in Triage, treat it as loose raw intake: it may be only a screenshot, brief bug report, enquiry, opinion, or suggestion. Classify it, check roadmap/backlog context, and if engineering work is needed, consolidate it into a backlog-ready ticket by posting a structured PM comment with problem statement, evidence, repro/expected/actual when applicable, proposed scope, acceptance criteria, duplicate/dependency check, labels, and priority. Do NOT add the 'AI-Ready' label — that is a human-only gate. If the ticket is actionable AND has 'AI-Ready' AND has no formal `blocks` relation in `inverseRelations` whose target is in a non-terminal state (per Step 6b), you MUST move it to 'In Progress' to trigger Developer — the PM's primary job is to route tickets forward, not to leave them in Todo for human review. Do NOT infer "engineering dependencies" from reading other tickets' titles, descriptions, or from past PM comments about "substrate gates" — only formal Linear `blocks` relations count as blockers. RE-EVALUATION CASE: if the ticket is ALREADY in 'In Progress' (or any non-Todo state) but on this scan you find a non-terminal `blocks` row in `inverseRelations.nodes`, you MUST revert the ticket to 'Todo' with a comment naming the blocker — a Developer dispatch on a blocked ticket is the bug, not the state to preserve. If the ticket does NOT have 'AI-Ready', triage it but move it only to 'Todo' or another intake/backlog state, or leave a clarification comment. If you post a clarification question, add the 'needs-human' label to alert humans. IMPORTANT: before taking any other action, check if any existing comments on this ticket contain a human question — if so, add 'needs-human' label and exit silently. If you make no changes or updates during triage (no labels, no priority change, no status change, no clarification comment needed), do NOT post a comment — exit silently.
 
   - agent_key: Developer
     toolsets:
@@ -470,9 +503,17 @@ pipeline:
          b. Check BOTH the pullRequest field AND attachments (Resources section).
          c. The pullRequest.baseRefName MUST be 'develop' — if it targets 'main' or anything else,
             this is a blocker. Post a comment noting the wrong base branch and STOP.
-         d. If pullRequest.isDraft is TRUE, ignore this PR — it is not ready for review.
-            Post a comment on the Linear ticket noting "Draft PR ignored, waiting for Developer
-            to mark it ready" and STOP without taking any further action.
+         d. If pullRequest.isDraft is TRUE:
+            - Post a comment on the Linear ticket noting "Draft PR ignored, the CI-poll
+              DRAFT-PROMOTE GATE should have flipped this to ready_for_review when CI
+              passed. If the PR is still draft here, the auto-promote likely failed."
+            - Move the ticket back to 'In Progress' so the next Developer dispatch
+              re-runs step 7a (ready_for_review=True) — leaving the ticket in 'In
+              Review' with a draft PR strands the pipeline (no Reviewer dispatch,
+              no Developer dispatch — operator had to nudge. PTD-43/44 case, Jul 6 2026).
+            - Add the `needs-human` label so the operator sees the stranded ticket.
+            - Exit cleanly. The next Developer dispatch will retry step 7a.
+            - Do NOT post a "Reviewer: ..." review comment — there is no review to record.
          e. If there are multiple attachments with PR URLs, use the MOST RECENT open PR
             (skip any that are draft).
          f. Extract the GitHub repo name and PR number from the PR URL.

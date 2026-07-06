@@ -958,6 +958,110 @@ def _github_get(fpath: str) -> Dict[str, Any]:
         return {}
 
 
+def _github_post(fpath: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """POST against the GitHub API. Returns {} on error.
+
+    Reserved for future use. CI-poll's DRAFT-PROMOTE GATE uses
+    ``_promote_pr_to_ready`` directly (GraphQL mutation) instead, because
+    the REST draft-toggle endpoint silently no-ops in the
+    ready_for_review direction (verified Jul 6 2026).
+    """
+    if not GITHUB_TOKEN:
+        return {}
+    try:
+        resp = requests.post(
+            GITHUB_API_URL + fpath,
+            headers=_github_headers(),
+            json=payload or {},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning("GitHub API POST %s failed: %s", fpath, e)
+        return {}
+
+
+def _promote_pr_to_ready(owner: str, repo: str, pr_number: int) -> bool:
+    """Auto-promote a draft PR to ready_for_review.
+
+    Used by the CI-poll DRAFT-PROMOTE GATE (PTD-43/PTD-44 case, Jul 6 2026).
+    Developer exits after pushing the commit and moving the ticket to
+    'CI in Progress' — they never get the chance to call step 7a's
+    ``ready_for_review=True`` because CI is still running when they exit.
+    When CI passes, the CI-poll fires this helper so the PR leaves draft
+    state in lockstep with the ticket leaving 'CI in Progress'.
+
+    Implementation note: GitHub confirmed (community discussion 70061,
+    Jul 6 2026) that the REST ``PATCH /pulls/{n} {"draft": false}``
+    silently no-ops on some PRs (returns 200 but ``draft`` stays True).
+    The reliable path is the GraphQL mutation
+    ``markPullRequestReadyForReview(input: {pullRequestId: "PR_..."})``.
+    ``gh pr ready`` uses this same mutation under the hood.
+
+    Returns True on success, False on any error (caller leaves the ticket
+    in 'CI in Progress' for the next Developer dispatch to retry).
+    """
+    if not GITHUB_TOKEN:
+        logger.warning(
+            "Cannot promote PR #%d — no GITHUB_TOKEN configured", pr_number,
+        )
+        return False
+    # Step 1: resolve PR number → node ID via REST (GET /pulls/{n} returns
+    # the node_id field as ``id``).
+    pr_data = _github_get(f"/repos/{owner}/{repo}/pulls/{pr_number}")
+    pr_node_id = pr_data.get("node_id") if pr_data else None
+    if not pr_node_id:
+        logger.warning(
+            "Cannot resolve PR #%d node_id for %s/%s", pr_number, owner, repo,
+        )
+        return False
+    # Step 2: GraphQL mutation markPullRequestReadyForReview.
+    graphql_url = "https://api.github.com/graphql"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/vnd.github+json",
+    }
+    mutation = (
+        'mutation MarkReady($id: ID!) { '
+        'markPullRequestReadyForReview(input: {pullRequestId: $id}) { '
+        'pullRequest { id isDraft } '
+        '} }'
+    )
+    try:
+        resp = requests.post(
+            graphql_url,
+            headers=headers,
+            json={"query": mutation, "variables": {"id": pr_node_id}},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:
+        logger.warning(
+            "Promote PR #%d: GraphQL markPullRequestReadyForReview failed: %s",
+            pr_number, e,
+        )
+        return False
+    # GraphQL errors come back as ``errors`` even with 200; treat as failure.
+    if body.get("errors"):
+        logger.warning(
+            "Promote PR #%d: GraphQL errors: %s",
+            pr_number, body["errors"],
+        )
+        return False
+    pr = (body.get("data") or {}).get("markPullRequestReadyForReview") or {}
+    inner = pr.get("pullRequest") or {}
+    if inner.get("isDraft") is False:
+        return True
+    logger.warning(
+        "Promote PR #%d: mutation succeeded but isDraft=%r",
+        pr_number, inner.get("isDraft"),
+    )
+    return False
+
+
 def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
     """Poll GitHub for CI status on a PR.
 
@@ -995,6 +1099,9 @@ def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
 
     head_sha = data.get("head", {}).get("sha", "")
     branch = data.get("head", {}).get("ref", "")
+    # Capture the draft flag now while we have the PR payload, so the
+    # CI-poll DRAFT-PROMOTE GATE can act on it without an extra round trip.
+    is_draft = bool(data.get("draft", False))
 
     # Get check runs for the head SHA
     check_data = _github_get(f"/repos/{owner}/{repo}/commits/{head_sha}/check-runs")
@@ -1005,11 +1112,18 @@ def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
             "status": "error",
             "error": "no check runs",
             "branch": branch,
+            "is_draft": is_draft,
         }
 
     runs = check_data.get("check_runs", []) or []
     if not runs:
-        return {"runs": [], "all_passed": None, "status": "no_runs", "branch": branch}
+        return {
+            "runs": [],
+            "all_passed": None,
+            "status": "no_runs",
+            "branch": branch,
+            "is_draft": is_draft,
+        }
 
     # Tally per-run state. GitHub sets ``status`` to ``queued`` /
     # ``in_progress`` while the run is live (conclusion is ``None``);
@@ -1029,7 +1143,13 @@ def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
         # Every still-running check is good news for now — keep polling,
         # but do NOT push a developer fix (root-cause was a premature
         # ``all_passed=False`` here).
-        return {"runs": runs, "all_passed": None, "status": "pending", "branch": branch}
+        return {
+            "runs": runs,
+            "all_passed": None,
+            "status": "pending",
+            "branch": branch,
+            "is_draft": is_draft,
+        }
     if failed:
         failed_names = [
             r.get("name", "?") for r in runs
@@ -1042,10 +1162,17 @@ def _get_ci_status_for_pr(owner: str, repo: str, pr_number: int) -> Dict[str, An
             "status": "failed",
             "failed_names": failed_names,
             "branch": branch,
+            "is_draft": is_draft,
         }
 
     # All runs completed with passing conclusions.
-    return {"runs": runs, "all_passed": True, "status": "passed", "branch": branch}
+    return {
+        "runs": runs,
+        "all_passed": True,
+        "status": "passed",
+        "branch": branch,
+        "is_draft": is_draft,
+    }
 
 
 async def _ci_poll_worker() -> None:
@@ -1053,7 +1180,8 @@ async def _ci_poll_worker() -> None:
 
     Runs GitHub checks and success/failure handling only while the Linear issue remains
     in ``CI in Progress``; otherwise the ticket is dropped from the poll set.
-    When all checks pass, move the ticket to 'In Progress'.
+    When all checks pass, move the ticket to 'In Review' (so Reviewer dispatch fires).
+    When CI fails, move the ticket back to 'In Progress' and enqueue Developer.
     When timeout is exceeded, remove the ticket from the polling set."""
     while not _worker_stop_event.is_set():
         try:
@@ -1098,24 +1226,68 @@ async def _ci_poll_worker() -> None:
 
                     ci = _get_ci_status_for_pr(owner, repo, pr_number)
                     ci_status = ci.get("status")
+                    is_draft = ci.get("is_draft")
                     logger.info(
-                        "CI poll %s: status=%s all_passed=%s runs=%d (elapsed=%.0fs)",
+                        "CI poll %s: status=%s all_passed=%s isDraft=%s runs=%d (elapsed=%.0fs)",
                         ticket_id,
                         ci_status,
                         ci.get("all_passed"),
+                        is_draft,
                         len(ci.get("runs", [])),
                         elapsed,
                     )
 
                     if ci_status == "passed":
-                        state_id = info.get("in_progress_state_id")
+                        # DRAFT-PROMOTE GATE: Developer left the PR as draft while
+                        # CI was running (per persona step 7a — "ready_for_review
+                        # AFTER CI is SUCCESS"). But Developer exits before that
+                        # final call lands, leaving the PR draft. Reviewer's
+                        # step 0d then refuses to act on draft PRs. So when CI
+                        # passes, CI-poll must auto-promote the PR out of draft
+                        # before moving the ticket to In Review — otherwise the
+                        # pipeline strands at "In Review" with a draft PR (the
+                        # PTD-43/PTD-44 bug, Jul 6 2026).
+                        promoted = True
+                        if is_draft:
+                            promoted = _promote_pr_to_ready(owner, repo, pr_number)
+                            if not promoted:
+                                logger.warning(
+                                    "CI poll %s: CI passed but PR #%d is still draft and "
+                                    "could not auto-promote — leaving ticket in 'CI in "
+                                    "Progress' so the next Developer dispatch can re-attempt.",
+                                    ticket_id, pr_number,
+                                )
+                                _post_linear_comment(
+                                    ticket_id,
+                                    f"⚠️ CI checks passed on branch `{ci.get('branch', 'unknown')}` "
+                                    f"but PR #{pr_number} is still a draft and the auto-promote "
+                                    f"to `ready_for_review=True` failed. Leaving ticket in "
+                                    f"`CI in Progress`; the next Developer dispatch will retry "
+                                    f"step 7a (per persona).",
+                                )
+                                continue  # leave in CI in Progress, do NOT move to In Review
+                            logger.info(
+                                "CI poll %s: auto-promoted draft PR #%d to ready_for_review",
+                                ticket_id, pr_number,
+                            )
+
+                        # Move to 'In Review' (NOT 'In Progress'). 'In Review' is the
+                        # state that triggers Reviewer dispatch via the
+                        # ``_ROLE_FOR_STATE`` mapping (line ~181). Sending the ticket
+                        # back to 'In Progress' here stranded it: the Reviewer would
+                        # never be auto-dispatched and an operator had to nudge the
+                        # ticket manually. See faworkshop CI-pass dispatch fix.
+                        state_id = info.get("in_review_state_id") or info.get("in_progress_state_id")
+                        target_state = "In Review" if info.get("in_review_state_id") else "In Progress"
                         if state_id:
                             _move_linear_ticket_state(ticket_id, state_id)
-                        logger.info("CI PASSED for %s — moved to In Progress", ticket_id)
+                        logger.info("CI PASSED for %s — moved to %s (auto-promoted draft=%s)",
+                                    ticket_id, target_state, is_draft)
                         _post_linear_comment(
                             ticket_id,
                             f"✅ CI checks passed on branch `{ci.get('branch', 'unknown')}` — "
-                            f"ticket moved to In Progress.",
+                            f"ticket moved to {target_state}."
+                            + (" (PR auto-promoted from draft by CI-poll.)" if is_draft else ""),
                         )
                         expired.append(ticket_id)
                     elif ci_status == "failed":
@@ -1541,11 +1713,47 @@ def _get_in_progress_state_id(ticket_id: str) -> str | None:
     return None
 
 
+def _get_in_review_state_id(ticket_id: str) -> str | None:
+    """Get the Linear state ID for 'In Review' for a ticket's team.
+    Returns None if the team has no 'In Review' state (e.g. teams whose
+    pipeline skips human review).
+
+    Used by the CI-pass branch of ``_ci_poll_worker`` to move the ticket
+    into the state that triggers Reviewer dispatch."""
+    query = """
+    query Issue($id: String!) {
+      issue(id: $id) {
+        team {
+          states {
+            nodes { id name }
+          }
+        }
+      }
+    }
+    """
+    data = _linear_gql(query, {"id": ticket_id})
+    if not data:
+        return None
+    nodes = (data.get("issue") or {}).get("team", {}).get("states", {}).get("nodes") or []
+    for state in nodes:
+        if _normalize_linear_state_name(state.get("name") or "") == "in review":
+            return state["id"]
+    return None
+
+
 def start_ci_poll(ticket_id: str, pr_number: int, owner: str, repo: str, branch: str,
-                  in_progress_state_id: str = None) -> None:
-    """Register a ticket for CI polling. Idempotent — replaces existing entry."""
+                  in_progress_state_id: str = None,
+                  in_review_state_id: str = None) -> None:
+    """Register a ticket for CI polling. Idempotent — replaces existing entry.
+
+    ``in_progress_state_id`` is the state used when CI FAILS (Developer re-engages).
+    ``in_review_state_id`` is the state used when CI PASSES (Reviewer dispatch fires).
+    Either may be None if the team lacks that state — fallbacks are applied at the
+    move site so an old in-flight poll set can still drain safely."""
     if in_progress_state_id is None:
         in_progress_state_id = _get_in_progress_state_id(ticket_id)
+    if in_review_state_id is None:
+        in_review_state_id = _get_in_review_state_id(ticket_id)
     _ci_polling_tickets[ticket_id] = {
         "pr_number": pr_number,
         "owner": owner,
@@ -1553,10 +1761,13 @@ def start_ci_poll(ticket_id: str, pr_number: int, owner: str, repo: str, branch:
         "branch": branch,
         "added_at": time.time(),
         "in_progress_state_id": in_progress_state_id,
+        "in_review_state_id": in_review_state_id,
         "failure_comment_posted": False,
     }
-    logger.info("Started CI polling for %s (PR #%d, branch=%s, in_progress_state_id=%s)",
-                ticket_id, pr_number, branch, in_progress_state_id)
+    logger.info(
+        "Started CI polling for %s (PR #%d, branch=%s, in_progress_state_id=%s, in_review_state_id=%s)",
+        ticket_id, pr_number, branch, in_progress_state_id, in_review_state_id,
+    )
 
 
 def stop_ci_poll(ticket_id: str) -> None:
@@ -1592,6 +1803,7 @@ def _redirect_to_ci_in_progress(
         repo=repo,
         branch=branch or "",
         in_progress_state_id=_get_in_progress_state_id(ticket_id),
+        in_review_state_id=_get_in_review_state_id(ticket_id),
     )
     logger.info(
         "Redirected %s to CI polling (PR #%d, branch=%s) — "
@@ -1820,8 +2032,10 @@ async def linear_webhook(request: Request):
             # Resolve repo owner/name from the PR data or repo label
             owner, repo = _resolve_repo_owner_repo(pr_info=pr_info if pr_info else None, data=data)
             in_progress_state_id = _get_in_progress_state_id(ticket_id)
+            in_review_state_id = _get_in_review_state_id(ticket_id)
             start_ci_poll(ticket_id, pr_number, owner, repo, branch,
-                          in_progress_state_id=in_progress_state_id)
+                          in_progress_state_id=in_progress_state_id,
+                          in_review_state_id=in_review_state_id)
             return {
                 "status": "ci_polling_started",
                 "ticket": ticket_id,
