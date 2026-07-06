@@ -121,6 +121,58 @@ _MAX_ACTIVE_TICKETS = int(os.getenv("HERMES_MAX_ACTIVE_TICKETS", "1"))
 # hold the single global slot. Product Manager runs against its own counter so
 # scanning can proceed concurrently with active implementation/verification work.
 _MAX_ACTIVE_PM_TICKETS = int(os.getenv("HERMES_MAX_ACTIVE_PM_TICKETS", "5"))
+
+# Rate-limit auto-requeue config — applied when an agent's LLM call (typically
+# Minimax HTTP 429 "Token Plan usage limit reached") aborts the task. Rather
+# than marking the task done and leaving the ticket stuck, the worker requeues
+# with exponential backoff. After _RATE_LIMIT_MAX_RETRIES consecutive
+# rate-limits, the task gives up and the normal failure path runs (notify
+# Linear, mark done) so the operator has visibility.
+_RATE_LIMIT_BACKOFF_INITIAL_SECONDS = float(
+    os.getenv("MAESTRO_RATE_LIMIT_BACKOFF_INITIAL_SECONDS", "60")
+)
+_RATE_LIMIT_BACKOFF_MAX_SECONDS = float(
+    os.getenv("MAESTRO_RATE_LIMIT_BACKOFF_MAX_SECONDS", "600")
+)
+_RATE_LIMIT_MAX_RETRIES = int(os.getenv("MAESTRO_RATE_LIMIT_MAX_RETRIES", "5"))
+
+
+def _is_rate_limit_error(err: str) -> bool:
+    """Detect LLM provider rate-limit errors so the worker can auto-requeue
+    instead of failing the task.
+
+    Patterns observed in the wild (Minimax Anthropic-compatible proxy):
+      - ``rate_limit_error: ...`` — Anthropic SDK error type prefix
+      - ``HTTP 429`` — the HTTP status code
+      - ``Token Plan usage limit reached`` — Minimax-specific message
+    Any one of these is sufficient. Match is case-insensitive on the type
+    prefix and HTTP status; case-sensitive on the Minimax phrase (it ships
+    that exact wording).
+    """
+    if not err:
+        return False
+    low = err.lower()
+    if "rate_limit_error" in low or "ratelimiterror" in low:
+        return True
+    if "http 429" in low or "status code: 429" in low or " 429 " in low:
+        return True
+    if "Token Plan usage limit reached" in err:
+        return True
+    return False
+
+
+def _rate_limit_backoff_seconds(attempt_count: int) -> float:
+    """Exponential backoff with cap: 60s, 120s, 240s, 480s, 600s (cap).
+
+    ``attempt_count`` is 1-based — the first requeue gets the initial value,
+    the second gets 2x, etc.
+    """
+    if attempt_count < 1:
+        attempt_count = 1
+    backoff = _RATE_LIMIT_BACKOFF_INITIAL_SECONDS * (2 ** (attempt_count - 1))
+    return min(backoff, _RATE_LIMIT_BACKOFF_MAX_SECONDS)
+
+
 _PM_SCANNER_ENABLED = os.getenv("PM_SCANNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 _PM_SCANNER_INTERVAL_SECONDS = float(os.getenv("PM_SCANNER_INTERVAL_SECONDS", "900"))
 _PM_SCANNER_LIMIT = int(os.getenv("PM_SCANNER_LIMIT", "50"))
@@ -558,7 +610,7 @@ _MAX_TASK_LAST_ERROR_LEN = 4000
 class AgentTaskRunResult:
     """Outcome of ``run_agent_task`` for ``complete_task`` / requeue bookkeeping."""
 
-    outcome: str  # success | failed | requeued_after_timeout | ci_redirect
+    outcome: str  # success | failed | requeued_after_timeout | requeued_after_rate_limit | ci_redirect
     error: Optional[str] = None
 
     def terminal_error_for_task(self) -> Optional[str]:
@@ -688,8 +740,22 @@ async def run_agent_task(
         logger.warning("Agent task cancelled for %s/%s", role, ticket_id)
         raise
     except Exception as e:
+        err_msg = f"{type(e).__name__}: {e}"
+        if _is_rate_limit_error(err_msg):
+            # Rate-limit is transient infrastructure (Minimax token-plan cap,
+            # Anthropic HTTP 429, etc.). Do NOT mark the task failed — the
+            # worker will auto-requeue with exponential backoff and try
+            # again, then give up after MAESTRO_RATE_LIMIT_MAX_RETRIES with
+            # the normal failure path. This avoids the "task done, ticket
+            # silently stuck" failure mode that hit PTD-45 dev + PTD-46
+            # QA on Jul 6 2026.
+            logger.warning(
+                "Rate-limit detected for %s Agent on %s — will auto-requeue. Error: %s",
+                role, ticket_id, err_msg[:500],
+            )
+            return AgentTaskRunResult("requeued_after_rate_limit", err_msg)
         logger.error(f"Error running {role} Agent for {ticket_id}: {e}")
-        return AgentTaskRunResult("failed", f"{type(e).__name__}: {e}")
+        return AgentTaskRunResult("failed", err_msg)
     finally:
         if heartbeat_task is not None and not heartbeat_task.done():
             heartbeat_task.cancel()
@@ -770,6 +836,49 @@ async def _agent_worker(role: str) -> None:
                         role,
                         ticket_id,
                     )
+                elif run_result.outcome == "requeued_after_rate_limit":
+                    # Auto-requeue the same task with exponential backoff. The
+                    # rate-limit count is INDEPENDENT of the retries circuit
+                    # breaker (which fires when the agent itself is broken) —
+                    # a rate-limit is transient infrastructure, not an agent
+                    # defect. After MAESTRO_RATE_LIMIT_MAX_RETRIES consecutive
+                    # rate-limits, fall through to the normal failure path
+                    # so the operator has visibility.
+                    new_rl_count = cm.bump_rate_limit_count(task_id)
+                    if new_rl_count > _RATE_LIMIT_MAX_RETRIES:
+                        logger.error(
+                            "Task %s (%s/%s) rate-limited %d times — giving up. "
+                            "Falling through to normal failure path.",
+                            task_id, role, ticket_id, new_rl_count,
+                        )
+                        err = (
+                            f"Rate-limit gave up after {new_rl_count} attempts: "
+                            f"{run_result.terminal_error_for_task() or 'unknown'}"
+                        )
+                        cm.complete_task(task_id, success=False, error=err)
+                        try:
+                            _notify_linear_agent_blocked_on_queue_failure(
+                                ticket_id, role, err, task_id=task_id
+                            )
+                        except Exception as notify_exc:
+                            logger.error(
+                                "After rate-limit giveup, Linear Blocked notify failed: %s",
+                                notify_exc, exc_info=True,
+                            )
+                    else:
+                        backoff = _rate_limit_backoff_seconds(new_rl_count)
+                        err_msg = (
+                            run_result.terminal_error_for_task()
+                            or "rate_limit_error"
+                        )
+                        rl_err = f"[rate-limit retry {new_rl_count}/{_RATE_LIMIT_MAX_RETRIES}] {err_msg}"
+                        cm.requeue_task(task_id, delay_seconds=backoff, error=rl_err)
+                        logger.warning(
+                            "Task %s (%s/%s) rate-limited (attempt %d/%d) — "
+                            "requeued in %.0fs. Error: %s",
+                            task_id, role, ticket_id, new_rl_count,
+                            _RATE_LIMIT_MAX_RETRIES, backoff, err_msg[:300],
+                        )
                 elif run_result.outcome == "ci_redirect":
                     # CI gate intercepted the dispatch before the agent ran.
                     # Complete as success — the task correctly redirected to CI polling.

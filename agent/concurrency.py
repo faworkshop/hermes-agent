@@ -134,7 +134,8 @@ class ConcurrencyManager:
                 updated_at DOUBLE PRECISION NOT NULL,
                 started_at DOUBLE PRECISION,
                 finished_at DOUBLE PRECISION,
-                last_heartbeat_at DOUBLE PRECISION
+                last_heartbeat_at DOUBLE PRECISION,
+                rate_limit_count INTEGER NOT NULL DEFAULT 0
             )
             """,
             """
@@ -162,6 +163,22 @@ class ConcurrencyManager:
                 )
                 if cur.fetchone() is None:
                     cur.execute("ALTER TABLE agent_tasks ADD COLUMN last_heartbeat_at DOUBLE PRECISION")
+                # Backfill rate_limit_count on installs created before that column shipped.
+                # Tracks how many times the task was rate-limited (Minimax HTTP 429)
+                # so the worker can apply exponential backoff and give up after N
+                # consecutive rate-limits rather than failing the task outright.
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'agent_tasks'
+                      AND column_name = 'rate_limit_count'
+                    """
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        "ALTER TABLE agent_tasks ADD COLUMN rate_limit_count INTEGER NOT NULL DEFAULT 0"
+                    )
             conn.commit()
 
     # ----------------------------------------------------------------- connect
@@ -356,6 +373,33 @@ class ConcurrencyManager:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM retries WHERE ticket_id = %s", (ticket_id,))
             conn.commit()
+
+    def bump_rate_limit_count(self, task_id: int) -> int:
+        """Increment the per-task rate-limit counter, returning the new value.
+
+        Tracks how many times the same task has hit a Minimax HTTP 429.
+        The webhook worker reads this to decide between (a) requeue with
+        exponential backoff and (b) give up and notify Linear.
+
+        This counter is INDEPENDENT of the ``retries`` table used by the
+        circuit breaker (3 retries = the agent itself is broken). A
+        rate-limit retry is transient infrastructure, not an agent defect.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET rate_limit_count = rate_limit_count + 1,
+                        updated_at = %s
+                    WHERE id = %s
+                    RETURNING rate_limit_count
+                    """,
+                    (time.time(), int(task_id)),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return int(row[0]) if row else 0
 
     # ------------------------------------------------------------- tasks CRUD
 
@@ -927,7 +971,8 @@ class ConcurrencyManager:
 _TASK_SELECT = """
 SELECT id, ticket_id, role, prompt, state, dedup_key, source_state, session_id,
        attempts, next_run_at, last_error,
-       created_at, updated_at, started_at, finished_at, last_heartbeat_at
+       created_at, updated_at, started_at, finished_at, last_heartbeat_at,
+       rate_limit_count
 FROM agent_tasks
 """
 
@@ -959,4 +1004,5 @@ def _row_to_dict(row) -> dict[str, Any]:
         "started_at": float(row[13]) if row[13] is not None else None,
         "finished_at": float(row[14]) if row[14] is not None else None,
         "last_heartbeat_at": float(row[15]) if row[15] is not None else None,
+        "rate_limit_count": int(row[16]) if row[16] is not None else 0,
     }
