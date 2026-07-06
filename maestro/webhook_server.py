@@ -261,7 +261,14 @@ def _linear_gql(query: str, variables: Dict[str, Any] = None) -> Dict[str, Any]:
             return {}
         return result.get("data", {})
     except Exception as e:
-        logger.error("Linear API request failed: %s", e)
+        # DEBUG: include response body for diagnosis
+        body = ""
+        try:
+            if hasattr(e, 'response') and e.response is not None:
+                body = e.response.text[:500]
+        except Exception:
+            pass
+        logger.error("Linear API request failed: %s body=%s query=%s vars=%s", e, body, query[:200], variables)
         return {}
 
 # Linear state titles are user-defined; casing/spacing can differ from our canonical labels
@@ -682,6 +689,9 @@ def _issue_has_label_name(linear_issue_uuid: str, label_name: str) -> bool:
         return False
     if label_name.strip().casefold() == "ai-ready":
         return _issue_has_label(linear_issue_uuid, "AI-Ready")
+    # NOTE: Linear's `issue(id:)` field actually wants `String!` here (this
+    # field is one of the older parts of the schema that didn't migrate to ID!).
+    # Tested via direct GraphQL: `String!` works, `ID!` returns 400.
     query = """
     query IssueLabelsByName($id: String!) {
       issue(id: $id) {
@@ -836,8 +846,11 @@ def _latest_comments_match_gate(
     """
     if not linear_issue_uuid:
         return False
+    # NOTE: Linear's `issue(id:)` field actually wants `String!` here (this
+    # field is one of the older parts of the schema that didn't migrate to ID!).
+    # Tested via direct GraphQL: `String!` works, `ID!` returns 400.
     query = """
-    query IssueRecentComments($id: String!) {
+    query IssueRecentComments($id: String!, $limit: Int!) {
       issue(id: $id) {
         comments(last: $limit) {
           nodes { body }
@@ -1001,9 +1014,12 @@ def _find_blocked_gate_candidates(limit: int = 100) -> list[dict[str, Any]]:
     """
     if not LINEAR_API_KEY:
         return []
+    # NOTE: IssueOrderByInput is an input object (not a bare enum), so we
+    # cannot pass a bare `updatedAt`. Use updatedAt desc via the nested
+    # `updatedAt: { direction: DESC }` form, or omit and rely on default order.
     query = """
     query GateRecheckCandidates($first: Int!) {
-      issues(first: $first, orderBy: updatedAt) {
+      issues(first: $first) {
         nodes {
           id
           identifier
