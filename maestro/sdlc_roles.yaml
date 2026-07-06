@@ -97,6 +97,15 @@ pipeline:
         - "Wait for blocker to be safely shipped before dispatching" — that
           is exactly what the blocker check below does automatically. Do NOT
           pre-emptively hold when the blocker check would clear it.
+        - "Frontend substrate doesn't exist" / "endpoint X is missing" /
+          "design file gate tripped" / "phantom consumer" — these are
+          EITHER transient gate trips (operator will unblock when the
+          underlying issue is resolved) OR real blockers that should be
+          tracked as a `Blocked` workflow state with a formal `blocks`
+          relation in Linear. They are NOT human-decision-required
+          cases. If a previous agent run added `needs-human` for any of
+          these reasons, REMOVE the label (per Step 13) and route the
+          ticket per Step 9.
 
       When in doubt, prefer moving the ticket forward. A wrong routing
       decision can be corrected by the next state change; a Todo hold
@@ -232,6 +241,14 @@ pipeline:
       13. If the ticket has a 'needs-human' label, remove it — it is an automated SDLC ticket, not a human-escalated one.
          EXCEPTION: leave 'needs-human' in place if a prior PM run identified a genuine
          human-blocker (per the criteria above) that is still unresolved.
+         A prior PM comment citing "substrate", "phantom endpoint",
+         "design file gate", "frontend substrate doesn't exist", or
+         "engineering dependency inferred from ticket titles" is NOT a
+         genuine human-blocker. If the ticket has `needs-human` and the
+         most recent prior PM comment cites one of these patterns, REMOVE
+         the label and route per Step 9. The label is a stale artifact of
+         the substrate-gate failure mode (per Step 6b's "ONLY formal
+         `blocks` relations count as blockers" rule).
       Do not write application code.
     prompt: |
       Ticket {{ticket_id}} has been created or moved to an intake state. If it is in Triage, treat it as loose raw intake: it may be only a screenshot, brief bug report, enquiry, opinion, or suggestion. Classify it, check roadmap/backlog context, and if engineering work is needed, consolidate it into a backlog-ready ticket by posting a structured PM comment with problem statement, evidence, repro/expected/actual when applicable, proposed scope, acceptance criteria, duplicate/dependency check, labels, and priority. Do NOT add the 'AI-Ready' label — that is a human-only gate. If the ticket is actionable AND has 'AI-Ready' AND has no formal `blocks` relation in `inverseRelations` whose target is in a non-terminal state (per Step 6b), you MUST move it to 'In Progress' to trigger Developer — the PM's primary job is to route tickets forward, not to leave them in Todo for human review. Do NOT infer "engineering dependencies" from reading other tickets' titles, descriptions, or from past PM comments about "substrate gates" — only formal Linear `blocks` relations count as blockers. RE-EVALUATION CASE: if the ticket is ALREADY in 'In Progress' (or any non-Todo state) but on this scan you find a non-terminal `blocks` row in `inverseRelations.nodes`, you MUST revert the ticket to 'Todo' with a comment naming the blocker — a Developer dispatch on a blocked ticket is the bug, not the state to preserve. If the ticket does NOT have 'AI-Ready', triage it but move it only to 'Todo' or another intake/backlog state, or leave a clarification comment. If you post a clarification question, add the 'needs-human' label to alert humans. IMPORTANT: before taking any other action, check if any existing comments on this ticket contain a human question — if so, add 'needs-human' label and exit silently. If you make no changes or updates during triage (no labels, no priority change, no status change, no clarification comment needed), do NOT post a comment — exit silently.
