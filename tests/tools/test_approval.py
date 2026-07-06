@@ -781,6 +781,28 @@ class TestGitDestructiveOps:
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
 
+    def test_git_push_force_with_lease_not_flagged(self):
+        """--force-with-lease is the safe force-push variant — refuses to
+        overwrite if remote moved. It must NOT be flagged as dangerous, so
+        Developer agents can use it to rebase after develop drift (e.g.
+        FAW Workshop clearing `mergeable_state: dirty`).
+        """
+        cmd = "git push --force-with-lease origin feature/PTD-44-x:y"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is False, (
+            f"--force-with-lease is the documented safe force-push variant; "
+            f"it should not be flagged. Got description: {desc!r}"
+        )
+
+    def test_git_push_force_if_includes_not_flagged(self):
+        """--force-if-includes is the other safe force-push variant."""
+        cmd = "git push --force-if-includes origin main"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is False, (
+            f"--force-if-includes is the documented safe force-push variant; "
+            f"it should not be flagged. Got description: {desc!r}"
+        )
+
     def test_git_branch_lowercase_d_also_flagged(self):
         """git branch -d triggers approval too — IGNORECASE is global.
 
