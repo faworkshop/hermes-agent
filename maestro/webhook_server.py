@@ -541,12 +541,19 @@ def _issue_has_label(linear_issue_uuid: str, label_name: str) -> bool:
 
 
 def _find_pm_intake_candidates(limit: int = 50) -> list[dict[str, Any]]:
-    """Return Linear issues in PM-owned intake states.
+    """Return Linear issues in PM-owned intake states that have ``AI-Ready``.
 
-    PM is allowed to triage both AI-Ready and non-AI-Ready tickets. The agent
-    rules prevent non-AI-Ready tickets from moving into implementation.
-    This scanner intentionally over-fetches and filters states locally to avoid
-    depending on Linear state-name filter edge cases.
+    PM only triages tickets the human has already blessed as ready for
+    implementation. Non-AI-Ready tickets are out of scope — the human adds
+    the ``AI-Ready`` label when they want PM to act, and PM's job is then
+    to route the ticket forward (set priority, add labels, check blockers,
+    promote to In Progress) — not to triage raw intake or write
+    clarification questions. The webhook still fires PM on state
+    transitions, so an AI-Ready ticket that lands in ``Todo`` directly
+    from human action still gets triaged.
+
+    This scanner intentionally over-fetches and filters states locally to
+    avoid depending on Linear state-name filter edge cases.
     """
     if not LINEAR_API_KEY:
         return []
@@ -568,6 +575,14 @@ def _find_pm_intake_candidates(limit: int = 50) -> list[dict[str, Any]]:
     for issue in nodes:
         state_name = ((issue.get("state") or {}).get("name") or "").strip()
         if _normalize_linear_state_name(state_name) not in _PM_INTAKE_STATES:
+            continue
+        # Skip non-AI-Ready tickets — PM is not in the loop for raw intake.
+        labels = (issue.get("labels") or {}).get("nodes") or []
+        has_ai_ready = any(
+            ((lbl.get("name") or "").strip().casefold() == "ai-ready")
+            for lbl in labels
+        )
+        if not has_ai_ready:
             continue
         candidates.append(issue)
     return candidates
