@@ -127,6 +127,9 @@ pipeline:
            containing: problem statement, evidence/source (screenshot or report summary),
            reproduction steps if applicable, expected vs actual behavior for bugs, proposed
            scope, acceptance criteria, dependencies/duplicates checked, labels, and priority.
+           As part of consolidation, classify the implementation surface per Step 8 and
+           apply the 'frontend' and/or 'backend' label(s) so the FE design-file gate
+           behaves correctly on the routed ticket.
          - If the consolidated ticket is NOT AI-Ready, keep it out of implementation by moving
            it only to 'Todo' (or another intake/backlog state) and request missing details.
          - Only if the consolidated ticket is AI-Ready and sufficiently actionable may you move
@@ -216,7 +219,23 @@ pipeline:
          the next state change; over-conservative `Todo` holds silently block
          the pipeline. When in doubt, promote.
       7. Assign an appropriate priority (1=Urgent, 2=High, 3=Medium, 4=Low) based on the business impact and the project roadmap context.
-      8. Add relevant labels (e.g., 'bug', 'feature', 'backend', 'enquiry', 'feedback', 'needs-clarification').
+      8. Add relevant labels. Always classify the ticket's implementation surface so the
+         FE design-file gate can decide whether a Stitch export is required:
+           - If the work touches UI, styling, HTML, React/Vue/Svelte components, layouts,
+             pages, views, CSS, or any other visual/frontend surface → add the 'frontend'
+             label. (This is the label the FE design-file gate reads; without it the gate
+             cannot enforce that an export under design/ui/stitch/ exists before Developer
+             is dispatched.)
+           - If the work touches API endpoints, DB schema/migrations, server logic,
+             background jobs, or any other backend surface → add the 'backend' label.
+           - If the work is genuinely full-stack (e.g. a feature that needs a new API
+             endpoint AND a new UI consuming it) → add BOTH 'frontend' AND 'backend'.
+           - If the ticket is non-engineering (enquiry, feedback, duplicate, spam,
+             needs-clarification) → add the appropriate non-eng label and skip the
+             frontend/backend classification entirely.
+         Other common labels: 'bug', 'feature', 'enquiry', 'feedback',
+         'needs-clarification'. Pick the smallest set that accurately describes the
+         ticket — do not over-label.
       9. ROUTE the ticket:
          - If AI-Ready + actionable + no blockers (per Step 6b below): move to 'In Progress' to trigger Developer.
          - If AI-Ready + blocked (per Step 6b): move to 'Todo' with a comment naming the blocker.
