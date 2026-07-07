@@ -363,15 +363,24 @@ pipeline:
              - Frontend: `cd apps/frontend && pnpm run lint && pnpm run type-check && pnpm run test:ci`
            git push is ONLY permitted after these commands pass. Do NOT skip this step.
          - Call github_get_pr_checks(repo, pr_number) to check CI status.
-         - If CI is RUNNING: FIRST call linear_update_status to move the ticket to
-           'CI in Progress', THEN exit immediately. Do NOT wait, do NOT poll, do NOT
-           loop. The webhook server handles CI polling. linear_update_status MUST be
-           your LAST action.
-         - If CI is FAILED: fix the failing tests or code locally (run `./mvnw test` after
-           each fix), push only after tests pass locally, then re-check CI.
-           Repeat until CI passes. Only after CI is SUCCESS do you proceed to Step 7.
-         - Only when BOTH test-frontend AND test-backend are SUCCESS may you proceed.
-           Do NOT enter any self-managed CI wait loop — always update Linear and exit.
+         - DO NOT poll, wait, or sleep while watching CI. The webhook server's CI-poll worker
+           handles post-CI state transitions for you. You do ONE of three things based on
+           a single check, then EXIT IMMEDIATELY:
+             (A) If CI is RUNNING or PENDING: call linear_update_status to move the ticket
+                 to 'CI in Progress' (so CI-poll can take over), then EXIT. No more tool calls.
+             (B) If CI is FAILED: fix the failing tests or code locally (run `./mvnw test` after
+                 each fix), push only after tests pass locally, then re-check CI.
+                 Repeat until CI passes. Only after CI is SUCCESS do you proceed to step 7.
+             (C) If CI is SUCCESS (all checks green): SKIP step (A) entirely. The ticket is
+                 still in 'In Progress' — that is fine. Proceed directly to step 7 to finalize.
+         IMPORTANT: option (C) is for when you have *just observed* CI passing on the same
+         PR you're working on. If you are uncertain whether CI has actually run (e.g. the PR
+         was just opened, or checks haven't appeared yet), default to (A) — moving to
+         'CI in Progress' is safe; the CI-poll worker will then move the ticket to
+         'In Review' once checks pass. Erring on the side of (A) is ALWAYS correct;
+         the failure mode this rule prevents is "agent exits after pushing but before
+         any linear_update_status call, leaving the ticket stuck in 'In Progress'".
+
       7. Once CI checks pass and the code is ready for review:
          a. Call github_update_pr(repo, pr_number, ready_for_review=True) to convert draft to OPEN.
             VERIFY the call returned a non-error response. Self-recovery rules:
@@ -394,14 +403,29 @@ pipeline:
               - VERIFY post-call: re-read the PR; confirm `pullRequest.isDraft` is
                 now FALSE. If it's still TRUE, treat as a failure and apply the
                 recovery path above.
-         b. Only after step (a) succeeds, call linear_update_status to move the ticket to
-            'In Review'. CRITICAL: linear_update_status MUST be your LAST action. Do NOT
-            post any comments, add any labels, or take any action after calling it.
+         b. ONLY after step (a) succeeds (or is correctly skipped), call linear_update_status
+            to move the ticket to 'In Review'. CRITICAL: linear_update_status MUST be your
+            LAST action. Do NOT post any comments, add any labels, or take any action
+            after calling it. This is true even if you came in via branch (C) above
+            (i.e. you observed CI as already green and skipped 'CI in Progress') — the
+            'In Review' move is the agent's own final step and is NOT something the
+            CI-poll worker will do for you when the ticket is still in 'In Progress'.
 
          NEVER move the ticket to 'In Review' if the PR is still a draft. The webhook server
          will block Reviewer dispatch and post a Linear comment if the PR is still a draft at
          that point — your goal is to never trigger that path. Always convert the draft to OPEN
          first.
+
+         FINAL EXIT CHECK (mandatory, run as your absolute last thought before stopping):
+           - Has `linear_update_status` been called in this session?
+             - YES, to 'CI in Progress' → exit cleanly. CI-poll will move to 'In Review' once CI passes.
+             - YES, to 'In Review' → exit cleanly. Reviewer dispatch is queued.
+             - YES, to 'In Progress' (recovery path) → exit cleanly. Next dispatch will retry.
+             - NO → you have a bug. The ticket will be stuck. Either re-dispatch yourself
+               (preferred if you have the context) or call linear_update_status to
+               'In Review' now IF AND ONLY IF the PR is open and CI is green. Otherwise
+               move the ticket to 'In Progress' with a brief comment so the next dispatch
+               sees it. Never exit without one of these three linear_update_status calls.
     prompt: |
       Ticket {{ticket_id}} is 'In Progress'. Your job: get CI green and move the ticket to 'In Review'.
 
