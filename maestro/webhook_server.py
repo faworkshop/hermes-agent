@@ -426,6 +426,19 @@ async def _trigger_unblock_pm(blocker_ticket_id: str, blocker_uuid: str) -> int:
                 "Unblock trigger: skipping %s (has needs-human label)", dep_id
             )
             continue
+        # Skip if the dependent has no AI-Ready label. The trigger's whole
+        # point is to be faster than the regular scanner for tickets that
+        # CAN move; for tickets without AI-Ready, PM has no way to advance
+        # them (the label is human-only), so re-triaging is a no-op.
+        # Mirrors the regular scanner's filter from commit 226d6515.
+        if not any(
+            ((lbl.get("name") or "").strip().casefold() == "ai-ready")
+            for lbl in labels
+        ):
+            logger.debug(
+                "Unblock trigger: skipping %s (no AI-Ready label)", dep_id
+            )
+            continue
         # Skip if a recent PM run already touched this ticket within the cooldown
         # window — avoids double-firing with the regular scanner cycle.
         last_done = cm.last_completed_task_for_role(

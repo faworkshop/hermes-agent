@@ -107,3 +107,47 @@ class TestFindPmIntakeCandidates:
     def test_empty_response_returns_empty(self, monkeypatch):
         find, _ = _patched_find(monkeypatch, [])
         assert find(50) == []
+
+
+class TestUnblockTriggerAiReadySkip:
+    """The unblock-trigger must skip dependents without AI-Ready, mirroring
+    the regular scanner's filter (commit 226d6515). Without this guard, the
+    trigger fires PM for any blocker-cleared dependent, even ones the human
+    hasn't blessed as ready for implementation. PM has no way to advance a
+    non-AI-Ready ticket (the label is human-only), so re-triaging is a no-op
+    and a token waste. Confirmed on PTD-61 (Jul 7 2026) when PTD-49 shipped
+    to Ready For Delivery and the trigger re-ran PM on a dependent with
+    no AI-Ready label.
+
+    The skip lives inline in ``_trigger_unblock_pm``; this test mirrors the
+    label iteration logic to lock the behavior in.
+    """
+
+    @staticmethod
+    def _has_ai_ready(labels):
+        return any(
+            ((lbl.get("name") or "").strip().casefold() == "ai-ready")
+            for lbl in labels
+        )
+
+    def test_ai_ready_present_passes(self):
+        labels = [{"name": "AI-Ready"}, {"name": "Phase 5"}]
+        assert self._has_ai_ready(labels) is True
+
+    def test_ai_ready_absent_skipped(self):
+        labels = [{"name": "Phase 5"}, {"name": "Feature"}]
+        assert self._has_ai_ready(labels) is False
+
+    def test_ai_ready_case_insensitive(self):
+        labels = [{"name": "ai-ready"}]
+        assert self._has_ai_ready(labels) is True
+        labels = [{"name": "Ai-Ready"}]
+        assert self._has_ai_ready(labels) is True
+
+    def test_ai_ready_empty_labels(self):
+        assert self._has_ai_ready([]) is False
+
+    def test_ai_ready_handles_none_name(self):
+        """Defensive: a label node with no name should not crash and not match."""
+        labels = [{"name": None}, {"name": "  "}]
+        assert self._has_ai_ready(labels) is False
