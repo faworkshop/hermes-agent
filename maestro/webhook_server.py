@@ -718,10 +718,10 @@ def _has_fe_design_files_on_branch(
     if cached is not None:
         fetched_at, entries = cached
         if (now - fetched_at) < _FE_DESIGN_GATE_CACHE_TTL_SECONDS:
-            for entry in entries:
-                return _match_design_entry(entry, prefix)
-            # Cache hit but no match — still authoritative (within TTL).
-            return False, None
+            # Cache hit — re-scan the cached tree the same way the first call
+            # did. We must NOT short-circuit on the first non-matching entry
+            # (the tree is unsorted and may have a match further in).
+            return _scan_tree_for_design(entries, prefix)
 
     tree = _fetch_branch_tree(o, r, b)
     if not tree and not GITHUB_TOKEN:
@@ -739,18 +739,33 @@ def _has_fe_design_files_on_branch(
         )
         return True, None
 
-    # Filter to the design prefix + extension match, cache the result.
-    matched: list[Optional[str]] = [None]
-    def _scan() -> bool:
-        for entry in tree:
-            hit = _match_design_entry(entry, prefix)
-            if hit[0]:
-                matched[0] = hit[1]
-                return True
-        return False
-    passed = _scan()
+    # Cache the raw tree, scan on every call (so the cache value is
+    # independent of which prefix the caller asks for — the test suite
+    # re-uses the same cache for different prefixes).
     _fe_design_gate_cache[cache_key] = (now, tree)
-    return passed, matched[0]
+    return _scan_tree_for_design(tree, prefix)
+
+
+def _scan_tree_for_design(
+    tree: list[dict[str, Any]], prefix: str
+) -> tuple[bool, Optional[str]]:
+    """Return ``(passed, sample_path)`` for ``tree`` under ``prefix``.
+
+    Pure function — separated from the cached helper so the test suite can
+    exercise it directly without mocking ``_github_get`` or the cache.
+    """
+    for entry in tree:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if not isinstance(path, str):
+            continue
+        if not path.startswith(prefix):
+            continue
+        if entry.get("type") != "blob":
+            continue
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in _FE_DESIGN_FILE_EXTENSIONS:
+            return True, path
+    return False, None
 
 
 def _match_design_entry(
