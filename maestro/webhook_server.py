@@ -109,7 +109,6 @@ _worker_tasks: dict[str, asyncio.Task] = {}
 _ci_poll_task: asyncio.Task | None = None
 _pm_scanner_task: asyncio.Task | None = None
 _watchdog_task: asyncio.Task | None = None
-_gate_recheck_task: asyncio.Task | None = None
 _worker_stop_event = asyncio.Event()
 _STALE_RUNNING_SECONDS = float(os.getenv("HERMES_QUEUE_STALE_RUNNING_SECONDS", "1800"))
 # Watch-dog: aggressively reaps stuck tasks based on heartbeat staleness.
@@ -183,48 +182,38 @@ _PM_SCANNER_LIMIT = int(os.getenv("PM_SCANNER_LIMIT", "50"))
 # state (e.g. blocked on upstream dependencies). Override with env if needed.
 _PM_SCANNER_COOLDOWN_SECONDS = float(os.getenv("PM_SCANNER_COOLDOWN_SECONDS", "7200"))
 
-# ── FE design-file gate (PTD-67) ─────────────────────────────────────────────
-# Frontend-scope tickets must reference a Stitch design export under
-# `design/ui/stitch/` in the project repo (HTML / PNG / JPG / WebP / JSON).
-# When the gate trips (no design files present), the webhook server adds
-# `needs-human`, moves the ticket to `Blocked`, and emits ONE failure comment
-# (cooldown-bounded so periodic re-checks don't spam the ticket). When design
-# files appear later, the periodic re-check worker AND the state-transition
-# re-check both clear the label and move the ticket forward automatically.
-_FE_DESIGN_DIR = Path(
-    os.getenv("FE_DESIGN_DIR_OVERRIDE")
-    or "/Users/maestro/faworkshop/ptdashboard/design/ui/stitch"
-)
-_FE_DESIGN_GATE_NAME = "design-file"  # used in cooldown key + INFO log lines
+# ── FE design-file gate ─────────────────────────────────────────────────────
+# Frontend-scope tickets (Frontend label) must reference a Stitch design export
+# committed to the project's ``develop`` branch under ``design/ui/stitch/``.
+# We check the **GitHub tree API** against the configured branch HEAD, not the
+# local filesystem, because a stale local checkout can lag ``develop`` and
+# false-positive the gate. The cache is short (60s) so the per-webhook cost
+# is one GitHub call.
+#
+# The gate is fail-OPEN: if the GitHub API errors, the gate passes (we don't
+# halt the pipeline on infrastructure failure). This is the right tradeoff
+# because the cost of a false-positive halt (a Developer dispatch blocked on
+# a stale local view) is much higher than the cost of a false-negative
+# (a missing design file reaching a Developer who will halt themselves).
+_FE_DESIGN_GATE_NAME = "design-file"  # used in INFO log lines
 _FE_DESIGN_FILE_EXTENSIONS = {".html", ".png", ".jpg", ".jpeg", ".webp", ".json"}
-_FE_DESIGN_HALT_TOKENS = (
-    "design file gate",
-    "design-file gate",
-    "design file",
-    "design-file",
-    "frontend substrate",
-    "stitch export",
-    "stitch",
+# Configurable for monorepos with multiple design dirs. We keep the path
+# constant for now — if a future project needs a different layout, expose
+# this via the SDLC role config rather than a separate env.
+_FE_DESIGN_GATE_REPO_OWNER = os.getenv("FE_DESIGN_GATE_REPO_OWNER", "faworkshop")
+_FE_DESIGN_GATE_REPO_NAME = os.getenv("FE_DESIGN_GATE_REPO_NAME", "ptdashboard")
+_FE_DESIGN_GATE_BRANCH = os.getenv("FE_DESIGN_GATE_BRANCH", "develop")
+_FE_DESIGN_GATE_TREE_PREFIX = os.getenv(
+    "FE_DESIGN_GATE_TREE_PREFIX", "design/ui/stitch/"
 )
-# Comment cooldown for periodic re-check failure emissions. On every failed
-# re-check we want exactly one comment per ticket per cooldown window — never
-# stack N comments on top of the original halt comment.
-_GATE_RECHECK_COOLDOWN_SECONDS = float(
-    os.getenv("MAESTRO_GATE_RECHECK_COOLDOWN_SECONDS", "21600")  # 6h
+# Cache for the branch-tree lookups. Keyed by ``f"{owner}/{repo}:{branch}"``,
+# valued ``(fetched_at_epoch, tree_entries_list)``. The TTL is short because
+# design exports get committed every few minutes during active work; long TTL
+# would let stale decisions linger.
+_FE_DESIGN_GATE_CACHE_TTL_SECONDS = float(
+    os.getenv("FE_DESIGN_GATE_CACHE_TTL_SECONDS", "60")
 )
-# Periodic re-check worker controls. The worker sweeps Blocked + needs-human
-# tickets whose halt comments reference the FE design-file gate and re-runs
-# the check. Disable for tests / one-off runs via env var.
-_GATE_RECHECK_ENABLED = os.getenv(
-    "MAESTRO_GATE_RECHECK_ENABLED", "true"
-).strip().lower() not in {"0", "false", "no", "off"}
-_GATE_RECHECK_INTERVAL_SECONDS = float(
-    os.getenv("MAESTRO_GATE_RECHECK_INTERVAL_SECONDS", "1800")  # 30 min
-)
-_GATE_RECHECK_LIMIT = int(os.getenv("MAESTRO_GATE_RECHECK_LIMIT", "100"))
-# Per-(ticket, gate) epoch-of-last-failed-comment. Only used by the failure
-# path of the periodic re-check; cleared on success or label removal.
-_gate_comment_cooldown: Dict[tuple[str, str], float] = {}
+_fe_design_gate_cache: Dict[str, tuple[float, list[str]]] = {}
 
 LINEAR_WEBHOOK_SECRET=os.getenv("LINEAR_WEBHOOK_SECRET") or os.getenv("LINEAR_HMAC_SECRET")
 LINEAR_BOT_USER_ID = os.getenv("LINEAR_BOT_USER_ID")
@@ -643,40 +632,142 @@ def _post_locked_comment(ticket_id: str, blocked_role: str, attempted_state: str
     logger.info("Posted lock-conflict comment on ticket %s", ticket_id)
 
 
-# ── FE design-file gate: helpers (PTD-67) ──────────────────────────────────
-def _has_fe_design_files(design_dir: Optional[Path] = None) -> tuple[bool, Optional[str]]:
+# ── FE design-file gate: helpers ────────────────────────────────────────────
+def _fetch_branch_tree(
+    owner: str, repo: str, branch: str
+) -> list[dict[str, Any]]:
+    """Return the recursive tree entries for ``{owner}/{repo}@{branch}``.
+
+    Uses the GitHub Git Trees API: ``GET /repos/{owner}/{repo}/git/trees/{branch_sha}?recursive=1``.
+    Two round-trips: first resolve the branch SHA via ``/branches/{branch}``,
+    then fetch the tree. Returns ``[]`` on any error (network, auth, 404,
+    5xx) — callers treat that as "could not determine" and fail-OPEN the gate.
+
+    The tree response can be very large for active repos. We request
+    ``recursive=1`` so a single call returns the whole tree. GitHub caps
+    truncated trees at 100k entries; if a repo exceeds that the response
+    has ``truncated: true`` and we treat the gate as fail-OPEN (couldn't
+    determine, don't halt).
+    """
+    if not GITHUB_TOKEN:
+        return []
+    # Step 1: resolve branch → SHA
+    branch_data = _github_get(f"/repos/{owner}/{repo}/branches/{branch}")
+    branch_obj = branch_data.get("commit") if isinstance(branch_data, dict) else None
+    if not branch_obj:
+        return []
+    sha = (branch_obj.get("sha") or "").strip()
+    if not sha:
+        return []
+    # Step 2: fetch the recursive tree at that SHA
+    tree_data = _github_get(
+        f"/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
+    )
+    if not isinstance(tree_data, dict):
+        return []
+    if tree_data.get("truncated"):
+        logger.warning(
+            "FE design-file gate: GitHub tree for %s@%s was truncated; "
+            "failing open",
+            owner, branch,
+        )
+        return []
+    tree = tree_data.get("tree") or []
+    return tree if isinstance(tree, list) else []
+
+
+def _has_fe_design_files_on_branch(
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    branch: Optional[str] = None,
+    tree_prefix: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
     """Return ``(passed, sample_path)`` for the FE design-file gate.
 
-    ``passed`` is True iff ``design_dir`` exists and contains at least one file
-    (at any depth) whose suffix is in ``_FE_DESIGN_FILE_EXTENSIONS``.
-    ``sample_path`` is the absolute path of one such file (useful for INFO
-    logs and operator debugging) or None when the gate fails.
+    ``passed`` is True iff the configured ``tree_prefix`` (default
+    ``design/ui/stitch/``) on the configured branch of the configured repo
+    contains at least one blob (file) whose suffix is in
+    ``_FE_DESIGN_FILE_EXTENSIONS``. ``sample_path`` is the path of one such
+    file (relative to the repo root) useful for INFO logs.
 
-    The scan is recursive because Stitch exports are organized under versioned
-    subdirectories (e.g. ``design/ui/stitch/v1/<screen-name>/code.html``).
-    A non-recursive scan would miss the actual exports and false-fail the gate.
+    We use the GitHub API rather than a local filesystem walk because the
+    Developer's local checkout can lag ``develop`` and false-positive the
+    gate. A short cache (``_FE_DESIGN_GATE_CACHE_TTL_SECONDS``, default 60s)
+    keeps the per-webhook cost to one GitHub call.
 
-    ``design_dir`` defaults to ``_FE_DESIGN_DIR`` so the operator can override
-    the scanned path per-call (handy for unit tests that don't want to depend
-    on the production ptdashboard checkout being present).
+    Fail-OPEN: on any error (no GITHUB_TOKEN, API 4xx/5xx, truncated tree,
+    network) we return ``(True, None)`` so the gate does not halt dispatch
+    on infrastructure failure. The Developer agent's own halt-on-missing-
+    files check (a re-verified ``git ls-tree`` against ``origin/develop``)
+    is the second line of defense; we'd rather have a missing-design
+    false-negative reach the Developer than a stale-local false-positive
+    halt block the entire pipeline.
     """
-    base = design_dir if design_dir is not None else _FE_DESIGN_DIR
-    try:
-        if not base.is_dir():
+    o = owner or _FE_DESIGN_GATE_REPO_OWNER
+    r = repo or _FE_DESIGN_GATE_REPO_NAME
+    b = branch or _FE_DESIGN_GATE_BRANCH
+    prefix = tree_prefix if tree_prefix is not None else _FE_DESIGN_GATE_TREE_PREFIX
+
+    if not o or not r or not b:
+        # Misconfigured — fail open.
+        return True, None
+
+    cache_key = f"{o}/{r}:{b}"
+    now = time.time()
+    cached = _fe_design_gate_cache.get(cache_key)
+    if cached is not None:
+        fetched_at, entries = cached
+        if (now - fetched_at) < _FE_DESIGN_GATE_CACHE_TTL_SECONDS:
+            for entry in entries:
+                return _match_design_entry(entry, prefix)
+            # Cache hit but no match — still authoritative (within TTL).
             return False, None
-    except OSError:
-        # Permission errors, broken symlinks, etc. — treat as "not present".
+
+    tree = _fetch_branch_tree(o, r, b)
+    if not tree and not GITHUB_TOKEN:
+        # No token configured: fail-open. Logged once via the missing-token
+        # path so the operator can fix.
+        logger.warning(
+            "FE design-file gate: GITHUB_TOKEN not set, failing open"
+        )
+        return True, None
+    if not tree:
+        # API errored — fail-open with a WARNING so operators can see it.
+        logger.warning(
+            "FE design-file gate: GitHub tree fetch failed for %s, failing open",
+            cache_key,
+        )
+        return True, None
+
+    # Filter to the design prefix + extension match, cache the result.
+    matched: list[Optional[str]] = [None]
+    def _scan() -> bool:
+        for entry in tree:
+            hit = _match_design_entry(entry, prefix)
+            if hit[0]:
+                matched[0] = hit[1]
+                return True
+        return False
+    passed = _scan()
+    _fe_design_gate_cache[cache_key] = (now, tree)
+    return passed, matched[0]
+
+
+def _match_design_entry(
+    entry: dict[str, Any], prefix: str
+) -> tuple[bool, Optional[str]]:
+    """True iff ``entry`` is a blob under ``prefix`` with a design-file suffix."""
+    if not isinstance(entry, dict):
         return False, None
-    try:
-        for root, _dirs, files in os.walk(base):
-            for fname in files:
-                suffix = os.path.splitext(fname)[1].lower()
-                if suffix in _FE_DESIGN_FILE_EXTENSIONS:
-                    full = os.path.join(root, fname)
-                    return True, str(Path(full).resolve())
-    except OSError:
+    if entry.get("type") != "blob":
         return False, None
-    return False, None
+    path = entry.get("path") or ""
+    if not path.startswith(prefix):
+        return False, None
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix not in _FE_DESIGN_FILE_EXTENSIONS:
+        return False, None
+    return True, path
 
 
 def _issue_has_label_name(linear_issue_uuid: str, label_name: str) -> bool:
@@ -716,53 +807,44 @@ def _is_fe_scope_ticket(linear_issue_uuid: str) -> bool:
 
 
 def _design_file_gate_check() -> tuple[bool, Optional[str]]:
-    """Single-source-of-truth call into ``_has_fe_design_files`` for the
-    production path. Kept tiny so the periodic worker, the state-transition
-    re-check, and any future caller (e.g. CI smoke test) all see identical
-    semantics.
+    """Single-source-of-truth call into the branch-tree gate for the production
+    path. Kept tiny so the state-transition re-check and any future caller
+    (e.g. CI smoke test) all see identical semantics.
     """
-    return _has_fe_design_files(_FE_DESIGN_DIR)
+    return _has_fe_design_files_on_branch()
 
 
 def _design_file_gate_halt_comment() -> str:
     """Markdown body for the ``design file gate tripped`` halt comment.
 
-    Single template so the periodic worker's failure path and the
-    state-transition trip path stay in sync. The comment mentions
-    ``_FE_DESIGN_DIR`` so an operator reading the Linear thread can find the
-    expected path without grepping the webhook source.
+    Single template so the state-transition trip path always produces the
+    same operator-facing message. The comment points operators at the
+    GitHub branch + tree path so they can verify directly without grepping
+    the webhook source.
     """
     return (
         "🛑 **Design File Gate — Blocked**\n\n"
         "This ticket is frontend-scope (has the `Frontend` label) but no Stitch "
-        "design export was found under:\n\n"
-        f"  `{_FE_DESIGN_DIR}`\n\n"
-        "**Required:** at least one file matching one of the accepted extensions "
-        "(*.html, *.png, *.jpg, *.jpeg, *.webp, *.json) — e.g. a Stitch HTML "
-        "export dropped into the directory above.\n\n"
+        "design export was found on the configured branch. The gate checks:\n\n"
+        f"  - **Repo:** `{_FE_DESIGN_GATE_REPO_OWNER}/{_FE_DESIGN_GATE_REPO_NAME}`\n"
+        f"  - **Branch:** `{_FE_DESIGN_GATE_BRANCH}`\n"
+        f"  - **Tree path:** `{_FE_DESIGN_GATE_TREE_PREFIX}`\n\n"
+        "**Required:** at least one file under the tree path matching one of the "
+        "accepted extensions (*.html, *.png, *.jpg, *.jpeg, *.webp, *.json) — e.g. a "
+        "Stitch HTML export committed to the branch above.\n\n"
         "**What happens next:**\n"
         "- The ticket stays in `Blocked` with the `needs-human` label.\n"
         "- On every webhook state-transition to `Todo` / `In Progress`, this "
         "server re-runs the gate automatically. As soon as the design file "
-        "appears, the label is cleared and the ticket is moved to `Todo` "
-        "(or `In Progress` if it was already AI-Ready).\n"
-        "- A periodic sweep (every 30 min by default) re-checks Blocked "
-        "tickets so they unblock even without operator intervention.\n\n"
-        "**Override env var:** `FE_DESIGN_DIR_OVERRIDE` — set this on the "
-        "webhook server process to point the gate at a non-default path.\n"
-    )
-
-
-def _design_file_gate_pass_comment(found_path: Optional[str]) -> str:
-    """Markdown body for the ``gate re-check passed`` comment."""
-    rel = found_path or "<unknown>"
-    return (
-        "✅ **Design File Gate — Cleared (auto)**\n\n"
-        "A Stitch design export is now present at:\n\n"
-        f"  `{rel}`\n\n"
-        "The `needs-human` label has been removed and the ticket has been "
-        "moved forward automatically by the webhook server. No operator "
-        "intervention was needed.\n"
+        "appears on the branch, the gate will pass and dispatch will resume.\n"
+        "- There is no periodic sweep or auto-clear — the `needs-human` label "
+        "is human-managed. When a human has resolved the design file gap, "
+        "remove the label (per the PM prompt's Step 13) so the next dispatch "
+        "can proceed.\n\n"
+        "**Override env vars:** `FE_DESIGN_GATE_REPO_OWNER`, "
+        "`FE_DESIGN_GATE_REPO_NAME`, `FE_DESIGN_GATE_BRANCH`, "
+        "`FE_DESIGN_GATE_TREE_PREFIX` — set these on the webhook server "
+        "process to point the gate at a different project or branch.\n"
     )
 
 
@@ -824,127 +906,38 @@ def _remove_linear_label_by_name(ticket_id: str, label_name: str) -> bool:
     return False
 
 
-def _comment_includes_gate_token(comment_body: str, tokens=tuple(_FE_DESIGN_HALT_TOKENS)) -> bool:
-    """True iff the comment body mentions any of the FE design-file gate
-    halt tokens (case-insensitive substring match). Used by the periodic
-    re-check worker to decide whether a Blocked + needs-human ticket is a
-    candidate for the design-file gate specifically — vs. some other reason
-    the operator added `needs-human`.
-    """
-    if not comment_body:
-        return False
-    body_low = comment_body.casefold()
-    return any(tok.casefold() in body_low for tok in tokens)
-
-
-def _latest_comments_match_gate(
-    linear_issue_uuid: str, tokens=tuple(_FE_DESIGN_HALT_TOKENS), limit: int = 10
-) -> bool:
-    """Return True iff any of the most recent ``limit`` comments on the ticket
-    mention a design-file-gate halt token. Used to identify stale-gate
-    tickets in the periodic sweep without trusting stale Linear state alone.
-    """
-    if not linear_issue_uuid:
-        return False
-    # NOTE: Linear's `issue(id:)` field actually wants `String!` here (this
-    # field is one of the older parts of the schema that didn't migrate to ID!).
-    # Tested via direct GraphQL: `String!` works, `ID!` returns 400.
-    query = """
-    query IssueRecentComments($id: String!, $limit: Int!) {
-      issue(id: $id) {
-        comments(last: $limit) {
-          nodes { body }
-        }
-      }
-    }
-    """
-    # Linear's ``last`` filter accepts a small int; 10 covers the original
-    # halt comment + a few re-check attempts.
-    data = _linear_gql(query, {"id": linear_issue_uuid, "limit": int(max(1, limit))})
-    comments = (
-        ((data.get("issue") or {}).get("comments") or {}).get("nodes") or []
-    )
-    for c in comments:
-        if _comment_includes_gate_token(c.get("body") or "", tokens):
-            return True
-    return False
-
-
-def _gate_recheck_log(
-    ticket_id: str,
-    result: str,
-    elapsed_ms: float,
-    path: Optional[str],
-    source: str,
-) -> None:
-    """Standard INFO-level log line for every gate re-check event. Format is
-    stable so operators can grep ``gate_recheck`` across the webhook_server
-    log and chart success/fail ratios over time.
-
-    ``source`` is one of ``"webhook"`` (state-transition path) or
-    ``"periodic"`` (the 30-min worker).
-    """
-    logger.info(
-        "gate_recheck ticket=%s gate=%s result=%s elapsed_ms=%.1f path=%r source=%s",
-        ticket_id, _FE_DESIGN_GATE_NAME, result, elapsed_ms, path, source,
-    )
-
-
-def _should_emit_gate_failure_comment(ticket_id: str, gate_name: str) -> bool:
-    """Cooldown gate for periodic re-check failure comments.
-
-    Returns True iff no failure comment was emitted within
-    ``_GATE_RECHECK_COOLDOWN_SECONDS`` for ``(ticket_id, gate_name)``. Records
-    the current epoch on True. Periodic failures return False (suppressed)
-    so a persistent gate failure does not stack N comments on the ticket.
-    """
-    now = time.time()
-    key = (ticket_id, gate_name)
-    last = _gate_comment_cooldown.get(key)
-    if last is not None and (now - float(last)) < _GATE_RECHECK_COOLDOWN_SECONDS:
-        return False
-    _gate_comment_cooldown[key] = now
-    return True
-
-
-def _clear_gate_failure_cooldown(ticket_id: str, gate_name: str) -> None:
-    """Drop the cooldown entry on a successful re-check so the next failure
-    emits immediately (vs. waiting out a stale window from a prior failure).
-    """
-    _gate_comment_cooldown.pop((ticket_id, gate_name), None)
-
-
 def _trip_fe_design_file_gate(
     ticket_id: str,
     linear_issue_uuid: str,
     *,
     source: str,
 ) -> str:
-    """Idempotent halt: adds ``needs-human``, moves to ``Blocked``, emits ONE
-    cooldown-aware failure comment. Returns ``"tripped"`` if a fresh failure
-    comment was emitted, ``"already_blocked"`` if the ticket was already in
-    Blocked + needs-human (no comment), or ``"noop"`` if the comment was
-    suppressed by the periodic cooldown.
+    """Idempotent halt: adds ``needs-human``, moves to ``Blocked``, posts the
+    halt comment. Returns ``"tripped"`` if a fresh comment was emitted,
+    ``"already_blocked"`` if the ticket was already in Blocked with the label.
 
-    Both ``linear_webhook`` (state-transition path) and ``_gate_recheck_worker``
-    (periodic sweep) call into this so the trip semantics are identical.
+    Called only from the state-transition path (``linear_webhook``). The
+    previous periodic recheck worker no longer exists — the human removes
+    the ``needs-human`` label when the design file gap is resolved.
     """
     # Add needs-human label (idempotent)
     _add_needs_human_label(ticket_id, blocked_role="Developer")
     # Move to Blocked (only if not already there)
     blocked_state_id = _get_team_workflow_state_id_by_normalized_name(linear_issue_uuid, "Blocked")
     current_state = _get_issue_state_normalized_from_identifier(ticket_id)
+    moved = False
     if blocked_state_id and current_state != "blocked":
-        _move_linear_ticket_state(ticket_id, blocked_state_id)
-    # Emit cooldown-aware failure comment
-    if _should_emit_gate_failure_comment(ticket_id, _FE_DESIGN_GATE_NAME):
-        _post_linear_comment(ticket_id, _design_file_gate_halt_comment())
-        logger.warning(
-            "gate_tripped ticket=%s gate=%s source=%s",
-            ticket_id, _FE_DESIGN_GATE_NAME, source,
-        )
-        return "tripped"
-    return "noop" if current_state == "blocked" else "already_blocked"
+        moved = _move_linear_ticket_state(ticket_id, blocked_state_id)
+    # Emit halt comment. We don't rate-limit: the trip path only fires on
+    # state transitions, and the upstream caller (state-transition re-check)
+    # already debounces that. A duplicate halt comment on a ticket that's
+    # already Blocked is fine — humans see the same message twice.
+    _post_linear_comment(ticket_id, _design_file_gate_halt_comment())
+    logger.warning(
+        "gate_tripped ticket=%s gate=%s source=%s moved=%s",
+        ticket_id, _FE_DESIGN_GATE_NAME, source, moved,
+    )
+    return "already_blocked" if current_state == "blocked" and not moved else "tripped"
 
 
 def _recheck_fe_design_file_gate(
@@ -953,161 +946,55 @@ def _recheck_fe_design_file_gate(
     *,
     source: str,
 ) -> str:
-    """Re-run the design-file gate. Idempotent and side-effect-aware.
+    """Re-run the design-file gate. Idempotent.
 
     Returns one of:
-    - ``"pass"``   — design files now present; cleared ``needs-human`` and
-      moved the ticket forward (to ``Todo`` or ``In Progress`` depending on
-      AI-Ready).
-    - ``"fail"``   — design files still missing; called ``_trip_fe_design_file_gate``
-      which either re-emitted the halt comment or suppressed it under cooldown.
+    - ``"pass"``   — design files present on the configured branch. We do
+      NOT auto-clear ``needs-human`` or move the ticket — the human decides
+      when the design file gap is resolved. (Previously the periodic
+      worker did this; that was removed because it produced false-positive
+      unblocks on stale local views.)
+    - ``"fail"``   — design files still missing; ``_trip_fe_design_file_gate``
+      was called to halt dispatch.
     - ``"skip"``   — ticket is not FE-scope (no ``Frontend`` label). Caller
       should NOT block dispatch on this result.
 
-    ``source`` is one of ``"webhook"`` (state-transition path) or
-    ``"periodic"`` (the 30-min worker); purely for logging.
+    ``source`` is the caller label (e.g. ``"webhook"``) for log correlation.
     """
     t0 = time.time()
     # Skip non-FE tickets entirely
     if not _is_fe_scope_ticket(linear_issue_uuid):
-        _gate_recheck_log(ticket_id, "skip", (time.time() - t0) * 1000.0, None, source)
+        logger.info(
+            "gate_recheck ticket=%s gate=%s result=skip elapsed_ms=%.1f "
+            "path=None source=%s (not FE-scope)",
+            ticket_id, _FE_DESIGN_GATE_NAME,
+            (time.time() - t0) * 1000.0, source,
+        )
         return "skip"
     passed, sample_path = _design_file_gate_check()
     elapsed_ms = (time.time() - t0) * 1000.0
     if not passed:
-        _gate_recheck_log(ticket_id, "fail", elapsed_ms, str(_FE_DESIGN_DIR), source)
+        logger.info(
+            "gate_recheck ticket=%s gate=%s result=fail elapsed_ms=%.1f "
+            "path=%r source=%s",
+            ticket_id, _FE_DESIGN_GATE_NAME, elapsed_ms,
+            f"{_FE_DESIGN_GATE_REPO_OWNER}/{_FE_DESIGN_GATE_REPO_NAME}@{_FE_DESIGN_GATE_BRANCH}:{_FE_DESIGN_GATE_TREE_PREFIX}",
+            source,
+        )
         _trip_fe_design_file_gate(
             ticket_id, linear_issue_uuid, source=source,
         )
         return "fail"
-    # Pass — clear needs-human label, then move forward
-    _gate_recheck_log(ticket_id, "pass", elapsed_ms, sample_path, source)
-    _clear_gate_failure_cooldown(ticket_id, _FE_DESIGN_GATE_NAME)
-    _remove_linear_label_by_name(ticket_id, "needs-human")
-    # Pick the target state: if AI-Ready, jump straight to In Progress so the
-    # next Developer dispatch fires without waiting for a PM triage cycle.
-    # Otherwise, send back to Todo so PM can pick it up.
-    target_state_name = (
-        "In Progress" if _issue_has_label_name(linear_issue_uuid, "AI-Ready") else "Todo"
-    )
-    target_state_id = _get_team_workflow_state_id_by_normalized_name(
-        linear_issue_uuid, target_state_name,
-    )
-    moved = False
-    if target_state_id:
-        moved = _move_linear_ticket_state(ticket_id, target_state_id)
-    _post_linear_comment(ticket_id, _design_file_gate_pass_comment(sample_path))
+    # Pass — log only. Do NOT touch the ``needs-human`` label, do NOT move
+    # the ticket, do NOT post a comment. The human (or the PM prompt's
+    # Step 13) is responsible for clearing the label when they've
+    # confirmed the design file gap is resolved.
     logger.info(
-        "gate_unblocked ticket=%s gate=%s moved_to=%s moved_ok=%s source=%s",
-        ticket_id, _FE_DESIGN_GATE_NAME, target_state_name, moved, source,
+        "gate_recheck ticket=%s gate=%s result=pass elapsed_ms=%.1f "
+        "path=%r source=%s (no auto-clear)",
+        ticket_id, _FE_DESIGN_GATE_NAME, elapsed_ms, sample_path, source,
     )
     return "pass"
-
-
-def _find_blocked_gate_candidates(limit: int = 100) -> list[dict[str, Any]]:
-    """Return Linear issues currently in ``Blocked`` workflow state.
-
-    Used by ``_gate_recheck_worker`` as the candidate set for stale-gate
-    re-checks. We over-fetch and filter to the ``Blocked`` state locally to
-    avoid Linear state-name filter quirks; the candidate set is then narrowed
-    further by ``_latest_comments_match_gate`` inside the worker.
-    """
-    if not LINEAR_API_KEY:
-        return []
-    # NOTE: IssueOrderByInput is an input object (not a bare enum), so we
-    # cannot pass a bare `updatedAt`. Use updatedAt desc via the nested
-    # `updatedAt: { direction: DESC }` form, or omit and rely on default order.
-    query = """
-    query GateRecheckCandidates($first: Int!) {
-      issues(first: $first) {
-        nodes {
-          id
-          identifier
-          state { name }
-          labels(first: 25) { nodes { name } }
-        }
-      }
-    }
-    """
-    data = _linear_gql(query, {"first": max(1, min(int(limit), 250))})
-    nodes = (data or {}).get("issues", {}).get("nodes") or []
-    out: list[dict[str, Any]] = []
-    for issue in nodes:
-        state_name = ((issue.get("state") or {}).get("name") or "").strip()
-        if _normalize_linear_state_name(state_name) != "blocked":
-            continue
-        labels = (issue.get("labels") or {}).get("nodes") or []
-        label_names = [(lbl.get("name") or "").strip().casefold() for lbl in labels]
-        if "needs-human" not in label_names:
-            continue
-        out.append(issue)
-    return out
-
-
-async def _gate_recheck_worker() -> None:
-    """Periodically sweep Blocked + needs-human tickets whose halt comments
-    reference the FE design-file gate, and re-run the gate. When the gate now
-    passes, auto-clear the label and move the ticket forward (to ``Todo`` if
-    non-AI-Ready, ``In Progress`` if AI-Ready). Failures are cooldown-bounded
-    so we do not spam the ticket with comments.
-
-    Runs inside the long-running webhook server process so a design-file drop
-    is detected without a restart (AC #2 — "no restart required").
-    """
-    logger.info(
-        "Starting gate recheck worker enabled=%s interval=%ss limit=%s cooldown=%ss",
-        _GATE_RECHECK_ENABLED,
-        _GATE_RECHECK_INTERVAL_SECONDS,
-        _GATE_RECHECK_LIMIT,
-        _GATE_RECHECK_COOLDOWN_SECONDS,
-    )
-    while not _worker_stop_event.is_set():
-        try:
-            if not _GATE_RECHECK_ENABLED:
-                await asyncio.sleep(max(5.0, _GATE_RECHECK_INTERVAL_SECONDS))
-                continue
-
-            candidates = _find_blocked_gate_candidates(_GATE_RECHECK_LIMIT)
-            scanned = 0
-            cleared = 0
-            failed = 0
-            skipped = 0
-            for issue in candidates:
-                ticket_id = (issue.get("identifier") or "").strip()
-                issue_uuid = (issue.get("id") or "").strip()
-                if not ticket_id or not issue_uuid:
-                    continue
-                scanned += 1
-                # Narrow to design-file gate tickets via the halt-comment text
-                if not _latest_comments_match_gate(issue_uuid):
-                    continue
-                # Run the recheck synchronously — Linear calls dominate the
-                # latency, the worker has no other shared state to coordinate
-                # with here, and we want clean INFO logs per ticket.
-                result = _recheck_fe_design_file_gate(
-                    ticket_id, issue_uuid, source="periodic",
-                )
-                if result == "pass":
-                    cleared += 1
-                elif result == "fail":
-                    failed += 1
-                else:
-                    skipped += 1
-
-            if scanned:
-                logger.info(
-                    "gate_recheck_worker scanned=%d cleared=%d failed=%d skipped=%d",
-                    scanned, cleared, failed, skipped,
-                )
-            await asyncio.sleep(max(5.0, _GATE_RECHECK_INTERVAL_SECONDS))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            note = _pg_queue_error_note(exc)
-            logger.error(
-                "gate_recheck_worker loop error: %s%s", exc, note, exc_info=True,
-            )
-            await asyncio.sleep(2.0)
 
 
 def verify_linear_signature(body: bytes, signature: str) -> bool:
@@ -2508,7 +2395,7 @@ def _get_ci_in_progress_state_id(ticket_id: str) -> str | None:
 
 @app.on_event("startup")
 async def _startup_workers() -> None:
-    global _ci_poll_task, _pm_scanner_task, _watchdog_task, _gate_recheck_task
+    global _ci_poll_task, _pm_scanner_task, _watchdog_task
     _log_queue_backend_at_startup()
     _worker_stop_event.clear()
     for role in _queue_roles():
@@ -2521,12 +2408,10 @@ async def _startup_workers() -> None:
         _pm_scanner_task = asyncio.create_task(_pm_intake_scanner_worker())
     if _watchdog_task is None or _watchdog_task.done():
         _watchdog_task = asyncio.create_task(_watchdog_worker())
-    if _gate_recheck_task is None or _gate_recheck_task.done():
-        _gate_recheck_task = asyncio.create_task(_gate_recheck_worker())
 
 
 async def _shutdown_workers() -> None:
-    global _ci_poll_task, _pm_scanner_task, _watchdog_task, _gate_recheck_task
+    global _ci_poll_task, _pm_scanner_task, _watchdog_task
     _worker_stop_event.set()
     tasks = [t for t in _worker_tasks.values() if not t.done()]
     if _ci_poll_task and not _ci_poll_task.done():
@@ -2535,8 +2420,6 @@ async def _shutdown_workers() -> None:
         tasks.append(_pm_scanner_task)
     if _watchdog_task and not _watchdog_task.done():
         tasks.append(_watchdog_task)
-    if _gate_recheck_task and not _gate_recheck_task.done():
-        tasks.append(_gate_recheck_task)
     for task in tasks:
         task.cancel()
     if tasks:
@@ -2545,7 +2428,6 @@ async def _shutdown_workers() -> None:
     _ci_poll_task = None
     _pm_scanner_task = None
     _watchdog_task = None
-    _gate_recheck_task = None
 
 
 def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
