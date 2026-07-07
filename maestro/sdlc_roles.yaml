@@ -730,6 +730,37 @@ pipeline:
          previous attempt probably passed them", and do NOT move to Ready For
          Delivery based on inference. Run the tests. Show the output. Then decide.
 
+      4. BUNDLER RUNTIME SMOKE IS MANDATORY FOR ANY FRONTEND-TOUCHING TICKET.
+         node:test with `PT_FIREBASE_STUB=1` / `PT_AUTH_STUB=***` does NOT verify
+         that the Quarkus Web Bundler actually emitted `/static/bundle/main.js`
+         or that the PostCSS/Tailwind pipeline actually processed `@tailwind`
+         directives. The post-merge blank-SPA regression and the unprocessed-
+         `@tailwind` regression both slipped through node:test on Phase 4 tickets
+         (PTD-60, PTD-58, PTD-59). A green node:test suite is necessary but NOT
+         sufficient for any ticket whose changed files include ANY of:
+           - `src/main/resources/web/**` (any frontend source/test/config)
+           - `.github/workflows/ci.yml` (build pipeline)
+           - `pom.xml` (Quarkus config, Web Bundler wiring)
+           - `package.json`, `package-lock.json`, `tsconfig.json`
+           - `postcss.config.js`, `tailwind.config.js`
+         For ANY such ticket — backend-only, frontend-only, or fullstack — you
+         MUST also run the bundler runtime smoke (see step 3b `b6.5` below).
+         If you cannot run the runtime smoke because the dev server fails to
+         start, port is taken, or the smoke command itself errors, that is a
+         FAIL (per Core Principle #2), not a pass.
+
+      5. MANUAL QA HANDOFF IS PART OF THE DELIVERABLE.
+         node:test + curl probes do not replace a human opening the browser.
+         A frontend-touching ticket (any ticket that changes anything under
+         `src/main/resources/web/`, OR any ticket that the previous core
+         principle flags as frontend-touching) MUST include a **Manual QA
+         handoff** section in the decision comment naming the exact command
+         sequence the operator should run to verify in a browser:
+           `docker compose up -d && ./mvnw quarkus:dev → open http://localhost:8081/`
+         If the smoke is supposed to render a specific page (e.g. /favorites,
+         /settings), name that URL. Do not post a final-pass comment without
+         this section — that is the DoD gap from PTD-60.
+
       MANDATORY SEQUENCE — perform EVERY step in order. Do NOT skip steps.
       If ANY step fails or returns an error, STOP and follow the ERROR HANDLING path.
       Do NOT skip test execution by reading or reusing results from prior QA cycles.
@@ -773,6 +804,27 @@ pipeline:
                b3. Skip Playwright entirely. Skip Firebase browser login. Skip frontend.
                b4. Add label `qa-backend-only` to the Linear ticket.
                b5. Skip to step 4.
+               b6.5. (BUNDLER RUNTIME SMOKE — only if the PR's changed files include
+                      any of the frontend-touching paths listed in Core Principle #4:
+                      `src/main/resources/web/**`, `.github/workflows/ci.yml`,
+                      `pom.xml`, `package.json`, `tsconfig.json`,
+                      `postcss.config.js`, `tailwind.config.js`).
+                      Run all of:
+                        (i)   `./mvnw -B test -Dtest=Phase4FrontendCoreStaticAssetsTest`
+                              (or the closest equivalent test class that boots Quarkus
+                              and asserts `/static/bundle/main.js` + `/static/bundle/main.css`
+                              are served). If the test class does not exist, FAIL the
+                              ticket with a comment naming that as a missing gate.
+                        (ii)  `curl -sf http://localhost:8081/static/bundle/main.css | \
+                              grep -q '@tailwind' && echo FAIL || echo OK`
+                              — FAIL if `@tailwind` is in the served CSS (PostCSS/Tailwind
+                              pipeline is broken and the directives leaked through).
+                        (iii) `curl -sf -o /dev/null -w "%{http_code}\n" \
+                              http://localhost:8081/static/bundle/main.js` → must print `200`.
+                      If the dev server is not already running, start it: `docker compose up -d
+                      postgres && ./mvnw quarkus:dev &` then wait for `Listening on: http://0.0.0.0:8081`.
+                      If you cannot run the smoke (env failure, port conflict, missing test
+                      class), that is a FAIL per Core Principle #2 — do NOT pass.
 
             ── IF frontend-only ──
                b1. Run frontend lint + typecheck + targeted unit/component tests:
@@ -786,6 +838,26 @@ pipeline:
                b3. Skip Playwright entirely (component tests already cover the UI behavior).
                b4. Add label `qa-frontend-only` to the Linear ticket.
                b5. Skip to step 4.
+               b6.5. (BUNDLER RUNTIME SMOKE — ALWAYS required for frontend-only tickets;
+                      see Core Principle #4). Run all of:
+                        (i)   `./mvnw -B test -Dtest=Phase4FrontendCoreStaticAssetsTest`
+                              (or the closest equivalent test class that boots Quarkus
+                              and asserts `/static/bundle/main.js` + `/static/bundle/main.css`
+                              are served). If the test class does not exist, FAIL the
+                              ticket with a comment naming that as a missing gate.
+                        (ii)  `curl -sf http://localhost:8081/static/bundle/main.css | \
+                              grep -q '@tailwind' && echo FAIL || echo OK`
+                              — FAIL if `@tailwind` is in the served CSS (PostCSS/Tailwind
+                              pipeline is broken and the directives leaked through).
+                        (iii) `curl -sf -o /dev/null -w "%{http_code}\n" \
+                              http://localhost:8081/static/bundle/main.js` → must print `200`.
+                        (iv)  `curl -sf http://localhost:8081/ | grep -q 'static/bundle/main.js'`
+                              — the served HTML must reference the bundle (catches the
+                              blank-SPA regression where the SPA fails to mount).
+                      Start the dev server first if needed: `docker compose up -d postgres && \
+                      ./mvnw quarkus:dev &` then wait for `Listening on: http://0.0.0.0:8081`.
+                      If you cannot run the smoke, that is a FAIL per Core Principle #2 —
+                      do NOT pass.
 
             ── IF fullstack ──
                b1. Spin up the full stack (Docker Compose: postgres + redis + backend + frontend).
@@ -827,6 +899,16 @@ pipeline:
                      - If Playwright fails to install, fails to launch chromium, or the
                        browser crashes → ENVIRONMENT FAILURE. Follow Core Principle #2.
                b6. Add label `qa-fullstack` to the Linear ticket.
+               b7. (BUNDLER RUNTIME SMOKE — always required for fullstack tickets; see
+                    Core Principle #4). The Playwright run already touches the live
+                    HTML/JS/CSS, so the bundle/PostCSS checks are partially covered
+                    (a missing main.js would 404 in the browser). Still, for fullstack
+                    tickets, additionally verify:
+                      (i)  `curl -sf http://localhost:8081/static/bundle/main.css | \
+                           grep -q '@tailwind' && echo FAIL || echo OK`
+                           — FAIL if `@tailwind` is in the served CSS.
+                      (ii) `curl -sf -o /dev/null -w "%{http_code}\n" \
+                           http://localhost:8081/static/bundle/main.js` → must print `200`.
 
          c. POST the actual test output to Linear via linear_post_comment BEFORE step 4.
             The comment MUST include:
@@ -836,6 +918,15 @@ pipeline:
               - Test counts: N passed / M failed (or "0 failed, N skipped" for backend-only)
               - For fullstack: the Playwright test names and their individual pass/fail
               - For environment failures: exactly which env var / file / dependency is missing
+              - **Manual QA handoff** (per Core Principle #5 — REQUIRED for any
+                frontend-touching ticket): a `## Manual QA handoff` section naming
+                the exact URL(s) the operator should open in a browser after
+                `docker compose up -d && ./mvnw quarkus:dev` to verify the change
+                end-to-end. E.g.:
+                  `## Manual QA handoff
+                   docker compose up -d && ./mvnw quarkus:dev
+                   open http://localhost:8081/        # SPA root renders (no blank, no 404 on /static/bundle/main.js)
+                   open http://localhost:8081/favorites  # signed-in favorites list (if applicable)`
             Do NOT skip this comment. Do NOT post a generic "tests pass" comment.
             If you cannot produce this comment with real output, you have not finished QA.
 
@@ -843,7 +934,8 @@ pipeline:
 
          IF in-scope tests passed and you posted real passing output in step 3c:
             a. Post a Linear comment via linear_post_comment with the SPECIFIC REASON.
-               Must include: scope label, commands run, pass/fail counts, PR number.
+               Must include: scope label, commands run, pass/fail counts, PR number,
+               AND (if frontend-touching) the Manual QA handoff section from step 3c.
                Example: "[backend-only] Ran `./mvnw test -Dtest=HelpfulVoteResourceTest` —
                12 tests, 0 failed, 0 skipped. curl /api/helpful-votes 200. PR #82 merged to develop.
                Moving to Ready For Delivery."
@@ -891,15 +983,39 @@ pipeline:
       If unsure, default to the NARROWER scope that matches what the ticket actually describes.
       Add the matching label before posting the result: `qa-backend-only` / `qa-frontend-only` / `qa-fullstack`.
 
-      Then pull latest `develop`, run the in-scope tests fresh (never reuse old results, never be influenced by prior QA comments), and POST the actual command output to Linear via linear_post_comment BEFORE deciding. The comment must name the scope, list the commands run with output snippets, and give test counts (N passed / M failed) — or for environment failures name exactly which env var / file / dependency is missing.
+      BUNDLER RUNTIME SMOKE — MANDATORY if the PR changed any of these paths:
+        `src/main/resources/web/**`, `.github/workflows/ci.yml`, `pom.xml`,
+        `package.json`, `package-lock.json`, `tsconfig.json`, `postcss.config.js`,
+        `tailwind.config.js`. This catches the post-merge blank-SPA regression
+        and the unprocessed-`@tailwind` regression that node:test with stubs does NOT.
+      Required checks (all must pass):
+        (i)   `./mvnw -B test -Dtest=Phase4FrontendCoreStaticAssetsTest`
+              (or the closest equivalent test class that boots Quarkus and
+              asserts `/static/bundle/main.js` + `/static/bundle/main.css` are served)
+        (ii)  `curl -sf http://localhost:8081/static/bundle/main.css | grep -q '@tailwind' && echo FAIL || echo OK`
+              — FAIL if `@tailwind` is in the served CSS (PostCSS/Tailwind broken)
+        (iii) `curl -sf -o /dev/null -w "%{http_code}\n" http://localhost:8081/static/bundle/main.js` → must print `200`
+        (iv)  `curl -sf http://localhost:8081/ | grep -q 'static/bundle/main.js'`
+              — the served HTML must reference the bundle (catches blank-SPA regression)
+      Start the dev server first if needed: `docker compose up -d postgres && ./mvnw quarkus:dev &`
+      then wait for `Listening on: http://0.0.0.0:8081`. If you cannot run the smoke
+      (env failure, port conflict, missing test class), that is a FAIL — do NOT pass.
 
-      IF in-scope tests passed with real output:
-        Post a SPECIFIC reason comment (scope + commands + counts + PR number), then
+      MANUAL QA HANDOFF — required for any frontend-touching ticket. The decision
+      comment MUST include a `## Manual QA handoff` section naming the exact URL(s)
+      the operator should open in a browser after `docker compose up -d && ./mvnw quarkus:dev`
+      to verify the change end-to-end.
+
+      Then pull latest `develop`, run the in-scope tests fresh (never reuse old results, never be influenced by prior QA comments), and POST the actual command output to Linear via linear_post_comment BEFORE deciding. The comment must name the scope, list the commands run with output snippets, give test counts (N passed / M failed) — or for environment failures name exactly which env var / file / dependency is missing. For frontend-touching tickets, also include the Manual QA handoff section.
+
+      IF in-scope tests passed with real output (and bundler smoke passed for frontend-touching tickets):
+        Post a SPECIFIC reason comment (scope + commands + counts + PR number + Manual QA handoff if applicable), then
         call linear_update_status(ticket_id, 'Ready For Delivery'). NEVER move to Done or Approved For Delivery — humans only.
         Stop after the status update.
 
       IF tests failed OR you could not run the in-scope tests (missing `.env.testing`,
-      missing FIREBASE_TEST_EMAIL, Playwright install/launch failure, broken DB, etc.):
+      missing FIREBASE_TEST_EMAIL, Playwright install/launch failure, broken DB,
+      missing bundler smoke test class, @tailwind leaked, etc.):
         That is a FAIL, not a pass. Post a SPECIFIC reason comment naming the failure and
         what is needed to unblock, then call github_add_label(repo, pr_number, ['qa-failed']),
         call linear_add_label(ticket_id, 'needs-human') for environment issues, and
