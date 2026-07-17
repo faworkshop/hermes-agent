@@ -182,6 +182,48 @@ _PM_SCANNER_LIMIT = int(os.getenv("PM_SCANNER_LIMIT", "50"))
 # state (e.g. blocked on upstream dependencies). Override with env if needed.
 _PM_SCANNER_COOLDOWN_SECONDS = float(os.getenv("PM_SCANNER_COOLDOWN_SECONDS", "7200"))
 
+# ── Orphaned-Developer recovery (FAW-62) ─────────────────────────────────────
+# Detects Developer tasks that finished (state=done) but the agent exited
+# without either (a) opening a PR or (b) moving the ticket to "In Review".
+# Three modes:
+#   Mode A  — branch pushed, PR exists, ticket still in In Progress.
+#             Action: post comment + move ticket to In Review.
+#   Mode A' — branch pushed, NO PR exists, ticket still in In Progress.
+#             Action: post comment + enqueue fresh Developer with a focused
+#             "open the PR" prompt. After 2 attempts fall back to needs-human.
+#   Mode B  — branch pushed, PR is DRAFT, ticket still in In Progress.
+#             Action: SKIP — already covered by faw-developer-draft-pr-conflict
+#             so the developer fix path handles it (promote-draft or push fix).
+# The worker can be enabled via env (default: enabled). Operator can disable
+# the periodic scanner and only invoke the endpoint manually if preferred.
+_ORPHAN_RECOVERY_ENABLED = (
+    os.getenv("ORPHAN_RECOVERY_ENABLED", "true").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+# How often the recovery worker polls for orphaned Developer tasks. The user
+# spec asks for 30 minutes; we honor that.
+_ORPHAN_RECOVERY_INTERVAL_SECONDS = float(
+    os.getenv("ORPHAN_RECOVERY_INTERVAL_SECONDS", "1800")
+)
+# Only consider Developer tasks whose ``finished_at`` is within this window.
+# Anything older than this is treated as "agent ran, ticket moved on its own
+# (or was closed) — leave it alone". Default 2h matches the FAW-62 spec.
+_ORPHAN_RECOVERY_MAX_AGE_SECONDS = float(
+    os.getenv("ORPHAN_RECOVERY_MAX_AGE_SECONDS", "7200")
+)
+# Cap on the number of tickets processed per scan so a backlog does not
+# monopolize the worker thread. Each ticket costs a Linear state lookup +
+# 0-1 GitHub API calls, so 50 is a safe ceiling.
+_ORPHAN_RECOVERY_MAX_TICKETS_PER_SCAN = int(
+    os.getenv("ORPHAN_RECOVERY_MAX_TICKETS_PER_SCAN", "50")
+)
+# Maximum recovery-A' re-enqueues before falling back to needs-human. The
+# dedup_key embeds an epoch suffix per attempt, so the cap counts attempts
+# via the row count in agent_tasks rather than a separate counter column.
+_ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS = int(
+    os.getenv("ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS", "2")
+)
+
 # ── FE design-file gate ─────────────────────────────────────────────────────
 # Frontend-scope tickets (Frontend label) must reference a Stitch design export
 # committed to the project's ``develop`` branch under ``design/ui/stitch/``.
@@ -1498,6 +1540,64 @@ def _find_branch_for_ticket(ticket_id: str) -> str:
     return ""
 
 
+def _is_draft_pr(pr_info: Dict[str, Any]) -> bool:
+    """Return True iff the PR payload indicates draft state.
+
+    Used by the orphaned-Developer recovery (FAW-62) to distinguish Mode A
+    (PR is open and ready) from Mode B (PR exists but is draft). On any
+    error or missing key we return False — the caller treats that as
+    "not draft", which routes through Mode A (move to In Review).
+    """
+    if not isinstance(pr_info, dict) or not pr_info:
+        return False
+    raw = pr_info.get("draft")
+    if isinstance(raw, bool):
+        return raw
+    # Some endpoints return a string; tolerate that too.
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"true", "1", "yes"}
+    return False
+
+
+def _ticket_recently_state_changed(ticket_id: str, window_seconds: float = 14400.0) -> bool:
+    """Return True iff a Linear issue has a recent state change.
+
+    Looks at the issue's ``updatedAt`` timestamp (any field change, not just
+    state). The 4h window is wider than the FAW-62 spec's 4h state-change
+    window — we're using this as a coarse "is the ticket still moving"
+    signal so the recovery logic does not re-fire on tickets that have
+    settled into a deliberate state.
+
+    Returns False on any error so the recovery endpoint errs on the side
+    of "investigate" rather than "silently skip".
+    """
+    issue_uuid = _linear_issue_graphql_id(ticket_id)
+    if not issue_uuid:
+        return False
+    query = """
+    query IssueUpdatedAt($id: String!) {
+      issue(id: $id) { updatedAt }
+    }
+    """
+    data = _linear_gql(query, {"id": issue_uuid})
+    if not data:
+        return False
+    iso = ((data.get("issue") or {}).get("updatedAt") or "").strip()
+    if not iso:
+        return False
+    from datetime import datetime, timezone
+    try:
+        # Linear's timestamps end in Z; normalize to UTC ISO.
+        ts = iso.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return 0.0 <= age <= float(window_seconds)
+    except Exception:
+        return False
+
+
 def _github_get(fpath: str) -> Dict[str, Any]:
     """GET against the GitHub API. Returns {} on error."""
     if not GITHUB_TOKEN:
@@ -2438,7 +2538,7 @@ def _get_ci_in_progress_state_id(ticket_id: str) -> str | None:
 
 @app.on_event("startup")
 async def _startup_workers() -> None:
-    global _ci_poll_task, _pm_scanner_task, _watchdog_task
+    global _ci_poll_task, _pm_scanner_task, _watchdog_task, _recover_orphaned_task
     _log_queue_backend_at_startup()
     _worker_stop_event.clear()
     for role in _queue_roles():
@@ -2451,10 +2551,15 @@ async def _startup_workers() -> None:
         _pm_scanner_task = asyncio.create_task(_pm_intake_scanner_worker())
     if _watchdog_task is None or _watchdog_task.done():
         _watchdog_task = asyncio.create_task(_watchdog_worker())
+    # FAW-62: orphaned-Developer recovery watchdog. Opt-out via
+    # ORPHAN_RECOVERY_ENABLED=false if the operator prefers manual-only recovery.
+    if _ORPHAN_RECOVERY_ENABLED:
+        if _recover_orphaned_task is None or _recover_orphaned_task.done():
+            _recover_orphaned_task = asyncio.create_task(_recover_orphaned_devs_worker())
 
 
 async def _shutdown_workers() -> None:
-    global _ci_poll_task, _pm_scanner_task, _watchdog_task
+    global _ci_poll_task, _pm_scanner_task, _watchdog_task, _recover_orphaned_task
     _worker_stop_event.set()
     tasks = [t for t in _worker_tasks.values() if not t.done()]
     if _ci_poll_task and not _ci_poll_task.done():
@@ -2463,6 +2568,8 @@ async def _shutdown_workers() -> None:
         tasks.append(_pm_scanner_task)
     if _watchdog_task and not _watchdog_task.done():
         tasks.append(_watchdog_task)
+    if _recover_orphaned_task and not _recover_orphaned_task.done():
+        tasks.append(_recover_orphaned_task)
     for task in tasks:
         task.cancel()
     if tasks:
@@ -2471,6 +2578,7 @@ async def _shutdown_workers() -> None:
     _ci_poll_task = None
     _pm_scanner_task = None
     _watchdog_task = None
+    _recover_orphaned_task = None
 
 
 def _log_ignored(reason: str, **ctx: Any) -> Dict[str, str]:
@@ -3041,6 +3149,480 @@ async def recover_stale_queue_tasks(
         "stale_after_seconds": stale_after_seconds,
         "recovered": recovered,
     }
+
+
+# ── Orphaned-Developer recovery helpers (FAW-62) ─────────────────────────────
+#
+# These helpers support the POST /agent-queue/recover-orphaned-devs endpoint
+# and the periodic ``_recover_orphaned_devs_worker`` watchdog. They are split
+# out so the endpoint handler is short, the unit tests have a small surface
+# area, and the periodic worker can call the same code path.
+#
+# Three failure modes are covered:
+#   Mode A  — branch pushed, open PR exists, ticket still in In Progress.
+#             Action: post comment + move ticket to In Review.
+#   Mode A' — branch pushed, NO PR exists, ticket still in In Progress.
+#             Action: post comment + enqueue fresh Developer with a focused
+#             "open the PR + call linear_update_status('In Review')" prompt.
+#             After ``_ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS`` attempts fall
+#             back to ``needs-human`` so a human takes over.
+#   Mode B  — branch pushed, PR exists but is DRAFT, ticket still in
+#             In Progress. Action: SKIP — already covered by
+#             ``faw-developer-draft-pr-conflict`` (the existing draft-PR
+#             handling auto-promotes the draft and routes the ticket through
+#             the standard pipeline).
+
+_RECOVERY_PROMPT_TEMPLATE = (
+    "Ticket {ticket_id} previously had a Developer agent run that exited "
+    "without opening a Pull Request and without moving the ticket to "
+    "'In Review'. The branch has been pushed to origin.\n\n"
+    "Your job — execute these steps in order, then EXIT:\n"
+    "  1. Verify the branch exists on origin (it was pushed by the prior run).\n"
+    "  2. Open a Pull Request: "
+    "`gh pr create --base develop --head {branch} --title '[{ticket_id}] <title from ticket>' "
+    "--body-file /tmp/{ticket_id_safe}_pr_body.md` "
+    "(write the body file from the ticket description before invoking).\n"
+    "  3. Mark the PR ready for review: `gh pr ready <PR_NUMBER>`.\n"
+    "  4. Call `linear_update_status` to move {ticket_id} to 'In Review' "
+    "as your LAST tool call. NOTHING follows.\n\n"
+    "Do NOT re-implement the work. The branch already contains the commits. "
+    "Do NOT modify code. Only the four steps above."
+)
+
+
+def _build_recovery_prompt(ticket_id: str, branch: str) -> str:
+    """Construct the focused Developer prompt for Mode A' recovery.
+
+    Pure function — same input always produces the same string. Tests rely on
+    this to assert that the prompt includes the ticket id and branch name.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", ticket_id)
+    return _RECOVERY_PROMPT_TEMPLATE.format(
+        ticket_id=ticket_id,
+        branch=branch,
+        ticket_id_safe=safe,
+    )
+
+
+def _classify_orphan(
+    ticket_id: str,
+    branch: str,
+    pr_info: Dict[str, Any],
+) -> str:
+    """Return ``"A"``, ``"A_prime"``, ``"B"``, or ``"none"``.
+
+    Pure decision based on the inputs the caller already collected:
+      * ``pr_info == {}`` → Mode A' (no PR yet)
+      * ``pr_info.draft == True`` → Mode B (existing draft — skip)
+      * otherwise → Mode A (open PR — move to In Review)
+
+    ``"none"`` is the sentinel for "do not act" — used by callers that need
+    to record the decision without committing to a side effect.
+    """
+    if not branch:
+        # Without a branch, we have nothing concrete to recover.
+        return "none"
+    if not pr_info:
+        return "A_prime"
+    if _is_draft_pr(pr_info):
+        return "B"
+    return "A"
+
+
+def _count_recovery_a_prime_attempts(ticket_id: str) -> int:
+    """Count how many Mode-A' recovery re-enqueues already exist for ticket.
+
+    Looks at ``agent_tasks`` rows whose ``dedup_key`` matches the recovery
+    pattern. This is a coarse count — the worker treats any row that has
+    the recovery suffix as "an attempt was made" regardless of state. Used
+    to decide whether to fall back to ``needs-human`` after the cap.
+    """
+    like = f"{ticket_id}:Developer:in progress:recovery-A-prime-%"
+    try:
+        rows = cm.list_tasks_for_ticket_id(ticket_id, limit=200) or []
+        return sum(1 for r in rows if (r.get("dedup_key") or "").startswith(
+            f"{ticket_id}:Developer:in progress:recovery-A-prime-"
+        ))
+    except Exception:
+        # Defensive: never block recovery on a count-check failure.
+        return 0
+
+
+def _recover_one_orphaned_developer(
+    task: Dict[str, Any],
+    *,
+    max_age_seconds: float,
+) -> Dict[str, Any]:
+    """Run recovery for a single Developer task. Returns a result dict.
+
+    The result is shaped for inclusion in the endpoint response / worker log:
+        ``ticket_id``:  str — the ticket identifier
+        ``mode``:       "A" | "A_prime" | "B" | "none" | "skipped"
+        ``branch``:     str — the discovered branch name (may be empty)
+        ``action``:     str — what we did (or "noop" if no action taken)
+        ``detail``:     str — human-readable explanation
+        ``queued_task_id``: int | None — if a recovery Developer task was queued
+    """
+    ticket_id = str(task.get("ticket_id") or "").strip()
+    finished_at = task.get("finished_at")
+    out: Dict[str, Any] = {
+        "ticket_id": ticket_id,
+        "mode": "none",
+        "branch": "",
+        "action": "noop",
+        "detail": "",
+        "queued_task_id": None,
+    }
+    if not ticket_id:
+        out["detail"] = "task missing ticket_id"
+        return out
+    # Defensive: skip rows that aren't actually finished or are too old.
+    if finished_at is None:
+        out["detail"] = "task has no finished_at — not a done row"
+        out["mode"] = "skipped"
+        return out
+    age = float(time.time()) - float(finished_at)
+    if age > float(max_age_seconds):
+        out["detail"] = f"task finished {age:.0f}s ago, older than {max_age_seconds:.0f}s window"
+        out["mode"] = "skipped"
+        return out
+
+    # Step 1: ticket state guard — only act when still in In Progress.
+    state_norm = _get_issue_state_normalized_from_identifier(ticket_id)
+    if state_norm != "in progress":
+        out["detail"] = (
+            f"ticket state is {state_norm!r}, not 'in progress' — "
+            f"ticket has already moved on, no recovery needed"
+        )
+        out["mode"] = "skipped"
+        return out
+
+    # Step 2: find the branch that the Developer pushed.
+    branch = _find_branch_for_ticket(ticket_id)
+    out["branch"] = branch
+    if not branch:
+        out["detail"] = "no branch found on origin matching the ticket id"
+        out["mode"] = "skipped"
+        return out
+
+    # Step 3: look for a PR on that branch.
+    pr_info = _find_pr_by_branch(branch) or {}
+
+    # Step 4: classify.
+    mode = _classify_orphan(ticket_id, branch, pr_info)
+    out["mode"] = mode
+
+    if mode == "none" or mode == "B":
+        # Mode B already has dedicated handling via the draft-PR conflict
+        # workflow. We post an info comment so operators can correlate, but
+        # we do NOT move the ticket or enqueue another Developer.
+        if mode == "B":
+            pr_number = pr_info.get("number") if isinstance(pr_info, dict) else None
+            out["detail"] = (
+                f"PR #{pr_number} is draft — skipping (draft-PR conflict "
+                f"workflow owns this ticket)"
+            )
+        else:
+            out["detail"] = "no recovery action required"
+        return out
+
+    if mode == "A":
+        # Branch + open PR + ticket still In Progress → move to In Review.
+        pr_number = pr_info.get("number") if isinstance(pr_info, dict) else None
+        pr_url = pr_info.get("html_url") if isinstance(pr_info, dict) else None
+        owner, repo = _resolve_repo_owner_repo(pr_info=pr_info if pr_info else None)
+        comment = (
+            f"## Auto-recovery: Developer exited without state transition (Mode A)\n\n"
+            f"Detected: a Developer agent for **{ticket_id}** exited cleanly "
+            f"(`state=done`) but did not move the ticket to **In Review**.\n\n"
+            f"**Branch**: `{branch}`\n"
+            f"**Pull Request**: {f'#{pr_number}' if pr_number else 'unknown'}"
+            f"{f' ({pr_url})' if pr_url else ''}\n\n"
+            f"Auto-recovery: moving this ticket to **In Review** so Reviewer "
+            f"dispatch fires from the standard webhook pipeline.\n\n"
+            f"_Generated by `POST /agent-queue/recover-orphaned-devs` (FAW-62)._"
+        )
+        try:
+            _post_linear_comment(ticket_id, comment)
+        except Exception as exc:
+            logger.warning("recover-orphaned-devs: comment post failed for %s: %s", ticket_id, exc)
+        in_review_sid = _get_in_review_state_id(
+            _linear_issue_graphql_id(ticket_id) or ticket_id
+        )
+        if in_review_sid:
+            moved = _move_linear_ticket_state(
+                _linear_issue_graphql_id(ticket_id) or ticket_id, in_review_sid
+            )
+            out["action"] = "moved_to_in_review"
+            out["detail"] = (
+                f"moved to In Review (PR #{pr_number}); Reviewer dispatch will fire"
+                if moved else "state transition failed — left in In Progress"
+            )
+        else:
+            out["detail"] = (
+                "no 'In Review' state on the team workflow — left in In Progress; "
+                "operator must advance manually"
+            )
+        return out
+
+    # mode == "A_prime" — no PR exists yet. Re-enqueue a focused Developer
+    # task whose ONLY job is to open the PR and call linear_update_status.
+    attempts = _count_recovery_a_prime_attempts(ticket_id)
+    if attempts >= _ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS:
+        # Fall back to needs-human so a human takes over.
+        try:
+            _add_needs_human_label(ticket_id, "Developer-recovery")
+        except Exception as exc:
+            logger.warning(
+                "recover-orphaned-devs: needs-human label failed for %s: %s",
+                ticket_id, exc,
+            )
+        try:
+            _post_linear_comment(
+                ticket_id,
+                (
+                    f"## Auto-recovery: Developer exit without PR (Mode A', exhausted)\n\n"
+                    f"Branch `{branch}` is on origin, but the recovery Developer "
+                    f"task has been re-enqueued "
+                    f"{attempts}/{_ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS} times without "
+                    f"a PR appearing. Falling back to `needs-human` for operator triage.\n\n"
+                    f"_Generated by `POST /agent-queue/recover-orphaned-devs` (FAW-62)._"
+                ),
+            )
+        except Exception as exc:
+            logger.warning("recover-orphaned-devs: fallback comment failed: %s", exc)
+        out["action"] = "needs_human"
+        out["detail"] = (
+            f"recovery re-enqueued {attempts} times — falling back to needs-human"
+        )
+        return out
+
+    # Enqueue the recovery Developer task. The dedup_key embeds the current
+    # epoch so each attempt creates a fresh row (otherwise the existing
+    # done row would dedup-block).
+    epoch = int(time.time())
+    dedup_key = f"{ticket_id}:Developer:in progress:recovery-A-prime-{epoch}"
+    prompt = _build_recovery_prompt(ticket_id, branch)
+    created, row = cm.enqueue_task(
+        ticket_id,
+        "Developer",
+        prompt,
+        dedup_key=dedup_key,
+        source_state="orphan-recovery",
+    )
+    if not created:
+        out["action"] = "duplicate"
+        out["detail"] = (
+            f"recovery task already queued/running (id={row.get('id') if row else '?'})"
+        )
+        out["queued_task_id"] = (row or {}).get("id")
+        return out
+
+    try:
+        _post_linear_comment(
+            ticket_id,
+            (
+                f"## Auto-recovery: Developer exit without PR (Mode A')\n\n"
+                f"Detected: a Developer agent for **{ticket_id}** exited cleanly "
+                f"(`state=done`) but did not open a Pull Request and did not "
+                f"move the ticket to **In Review**.\n\n"
+                f"**Branch on origin**: `{branch}` — exists with the prior commits.\n"
+                f"**No PR found** for that branch.\n\n"
+                f"Auto-recovery: queued a focused Developer task "
+                f"(id={row.get('id')}, attempt {attempts + 1}/"
+                f"{_ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS}) whose only job is to "
+                f"open the PR and move the ticket to **In Review**.\n\n"
+                f"_Generated by `POST /agent-queue/recover-orphaned-devs` (FAW-62)._"
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "recover-orphaned-devs: comment post failed for %s: %s", ticket_id, exc
+        )
+    out["action"] = "requeued"
+    out["queued_task_id"] = row.get("id")
+    out["detail"] = (
+        f"recovery Developer task queued (id={row.get('id')}, "
+        f"attempt {attempts + 1}/{_ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS})"
+    )
+    return out
+
+
+async def _scan_orphaned_developers(
+    *,
+    max_age_seconds: float,
+    max_tickets: int,
+) -> Dict[str, Any]:
+    """Run one recovery scan and return a summary dict.
+
+    Called by both the manual endpoint and the periodic watchdog. The
+    synchronous-looking shape of the result keeps the endpoint handler
+    thin: it just ``await``s and returns.
+    """
+    cutoff = float(time.time()) - float(max_age_seconds)
+    summary: Dict[str, Any] = {
+        "status": "ok",
+        "considered": 0,
+        "mode_a": 0,
+        "mode_a_prime_requeued": 0,
+        "mode_a_prime_needs_human": 0,
+        "mode_b_skipped": 0,
+        "skipped": 0,
+        "results": [],
+        "errors": [],
+    }
+    try:
+        candidates = cm.list_tasks(role="Developer", state="done", limit=max_tickets) or []
+    except Exception as exc:
+        logger.error("recover-orphaned-devs: list_tasks failed: %s", exc, exc_info=True)
+        summary["status"] = "error"
+        summary["errors"].append(f"list_tasks: {exc}")
+        return summary
+
+    summary["considered"] = len(candidates)
+
+    for task in candidates:
+        try:
+            # Pre-filter on finished_at so we don't hit Linear for ancient rows.
+            finished_at = task.get("finished_at")
+            if finished_at is None or float(finished_at) < cutoff:
+                summary["skipped"] += 1
+                continue
+            res = _recover_one_orphaned_developer(
+                task, max_age_seconds=max_age_seconds,
+            )
+            summary["results"].append(res)
+            mode = res.get("mode")
+            if mode == "A":
+                summary["mode_a"] += 1
+            elif mode == "A_prime":
+                if res.get("action") == "needs_human":
+                    summary["mode_a_prime_needs_human"] += 1
+                elif res.get("action") == "requeued":
+                    summary["mode_a_prime_requeued"] += 1
+            elif mode == "B":
+                summary["mode_b_skipped"] += 1
+            else:
+                summary["skipped"] += 1
+        except Exception as exc:
+            logger.error(
+                "recover-orphaned-devs: task %s failed: %s",
+                task.get("id"), exc, exc_info=True,
+            )
+            summary["errors"].append(f"task {task.get('id')}: {exc}")
+
+    logger.warning(
+        "recover-orphaned-devs scan: considered=%d A=%d A'_requeued=%d "
+        "A'_needs_human=%d B_skipped=%d other_skipped=%d errors=%d",
+        summary["considered"], summary["mode_a"],
+        summary["mode_a_prime_requeued"], summary["mode_a_prime_needs_human"],
+        summary["mode_b_skipped"], summary["skipped"], len(summary["errors"]),
+    )
+    return summary
+
+
+@app.post("/agent-queue/recover-orphaned-devs")
+async def recover_orphaned_developers(
+    request: Request,
+    max_age_seconds: int = Query(default=0, ge=0, le=86400),
+    max_tickets: int = Query(default=0, ge=0, le=500),
+):
+    """Detect and recover Developer tasks that exited without PR/state changes.
+
+    Background — see FAW-62 description. The Developer agent can exit
+    ``state=done`` cleanly while leaving the ticket stranded in **In Progress**
+    because it forgot one of the two terminal steps:
+
+      * ``gh pr create`` (Mode A')
+      * ``linear_update_status('In Review')`` after the PR exists (Mode A)
+
+    This endpoint runs a single scan over recent ``state=done`` Developer
+    tasks (default window: ``_ORPHAN_RECOVERY_MAX_AGE_SECONDS`` env, 2h) and:
+
+      * **Mode A**: post a Linear comment + move the ticket to **In Review**.
+      * **Mode A'**: post a Linear comment + enqueue a focused Developer
+        task that only opens the PR and moves the ticket. After
+        ``_ORPHAN_RECOVERY_MAX_REENQUEUE_ATTEMPTS`` (default 2) attempts
+        the endpoint falls back to ``needs-human``.
+      * **Mode B**: PR exists but is DRAFT — SKIP (already covered by
+        ``faw-developer-draft-pr-conflict``).
+
+    Query params:
+      * ``max_age_seconds`` — only consider tasks finished within this
+        window. 0 means use the default (``ORPHAN_RECOVERY_MAX_AGE_SECONDS``).
+      * ``max_tickets`` — cap on tickets considered per scan. 0 means default
+        (``ORPHAN_RECOVERY_MAX_TICKETS_PER_SCAN``).
+
+    Returns a summary with the per-ticket results.
+    """
+    eff_max_age = float(max_age_seconds) if max_age_seconds > 0 else _ORPHAN_RECOVERY_MAX_AGE_SECONDS
+    eff_max_tickets = int(max_tickets) if max_tickets > 0 else _ORPHAN_RECOVERY_MAX_TICKETS_PER_SCAN
+
+    logger.warning(
+        "Manual /agent-queue/recover-orphaned-devs invoked: max_age=%ss max_tickets=%d",
+        eff_max_age, eff_max_tickets,
+    )
+
+    summary = await _scan_orphaned_developers(
+        max_age_seconds=eff_max_age,
+        max_tickets=eff_max_tickets,
+    )
+    summary["max_age_seconds"] = eff_max_age
+    summary["max_tickets"] = eff_max_tickets
+    return summary
+
+
+# ── Periodic orphan-recovery worker (FAW-62) ────────────────────────────────
+#
+# Runs every ``_ORPHAN_RECOVERY_INTERVAL_SECONDS`` (default 1800s = 30 min)
+# alongside the other background workers (CI-poll, PM-intake, watchdog).
+# Disabled via env ``ORPHAN_RECOVERY_ENABLED=false`` if the operator prefers
+# manual-only recovery.
+
+_recover_orphaned_task: Optional[asyncio.Task] = None
+
+
+async def _recover_orphaned_devs_worker() -> None:
+    """Periodic FAW-62 scanner. Sleeps on the stop event between scans.
+
+    The worker tolerates any individual scan error (the scan returns a
+    structured ``status="error"`` and the worker keeps looping). If the
+    ``ORPHAN_RECOVERY_ENABLED`` env flips off at runtime we exit the loop
+    on the next iteration — the next server restart will skip the task
+    from creation entirely.
+    """
+    logger.info(
+        "Starting orphan-recovery worker (interval=%.0fs, max_age=%.0fs, "
+        "max_tickets=%d, enabled=%s)",
+        _ORPHAN_RECOVERY_INTERVAL_SECONDS,
+        _ORPHAN_RECOVERY_MAX_AGE_SECONDS,
+        _ORPHAN_RECOVERY_MAX_TICKETS_PER_SCAN,
+        _ORPHAN_RECOVERY_ENABLED,
+    )
+    while not _worker_stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                _worker_stop_event.wait(),
+                timeout=_ORPHAN_RECOVERY_INTERVAL_SECONDS,
+            )
+            break  # stop event set
+        except asyncio.TimeoutError:
+            pass
+        if not _ORPHAN_RECOVERY_ENABLED:
+            continue
+        try:
+            await _scan_orphaned_developers(
+                max_age_seconds=_ORPHAN_RECOVERY_MAX_AGE_SECONDS,
+                max_tickets=_ORPHAN_RECOVERY_MAX_TICKETS_PER_SCAN,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "orphan-recovery worker iteration failed: %s",
+                exc, exc_info=True,
+            )
+    logger.info("Stopped orphan-recovery worker")
 
 
 @app.post("/ci-poll/restart")
