@@ -15,31 +15,131 @@ def check_github_requirements() -> bool:
     """Check if GitHub integration is configured."""
     return bool(os.getenv("GITHUB_TOKEN"))
 
-def _execute_github_request(method: str, path: str, data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """Helper to execute a GitHub REST API request."""
-    token = os.getenv("GITHUB_TOKEN")
+
+def _resolve_token(explicit: Optional[str] = None) -> str:
+    """Resolve which GitHub PAT to use.
+
+    Priority: explicit kwarg > GITHUB_REVIEWER_TOKEN > GITHUB_TOKEN > GH_TOKEN.
+
+    The Reviewer mutating tools (github_approve_pr, github_merge_pr,
+    github_update_pr, github_post_review_comment) pass _resolve_token() so
+    they authenticate as a distinct identity (the reviewer bot) and
+    sidestep GitHub's self-approval rule (HTTP 422 when the approver
+    identity equals the PR author). The 12 read-side tools keep passing
+    nothing and fall back to GITHUB_TOKEN (the author identity) — that's
+    correct because they don't mutate PR state in a way that triggers
+    the rule.
+
+    Falls back to GITHUB_TOKEN SILENTLY if the reviewer token is unset —
+    see the module-level warning below emitted at import time so the
+    misconfiguration is visible at webhook startup, not just at first
+    422 in production.
+    """
+    if explicit:
+        return explicit
+    return (
+        os.getenv("GITHUB_REVIEWER_TOKEN")
+        or os.getenv("GITHUB_TOKEN")
+        or os.getenv("GH_TOKEN")
+        or ""
+    )
+
+
+# Module-level: warn loudly if the reviewer token is missing. The fallback
+# below will silently use GITHUB_TOKEN (the author identity) otherwise,
+# and the only symptom is HTTP 422 in production when the Reviewer hits
+# approve on its own PR. This is the "fundamental check" — make the
+# misconfiguration visible at the source so the operator sees it in the
+# webhook log on every startup, not just when production breaks.
+if not os.getenv("GITHUB_REVIEWER_TOKEN"):
+    logger.warning(
+        "github_tool: GITHUB_REVIEWER_TOKEN is not set. The Reviewer "
+        "agent's mutating calls (approve, merge, update, review comment) "
+        "will fall back to GITHUB_TOKEN (author identity = fwsmaestro) "
+        "and 422 on self-authored PRs. Set GITHUB_REVIEWER_TOKEN in "
+        "~/.hermes/.env to a PAT for a separate GitHub user "
+        "(e.g. fwsmaestro-reviewer) and restart the webhook server."
+    )
+
+
+def _execute_github_request(method: str, path: str, data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, *, token: Optional[str] = None) -> Dict[str, Any]:
+    """Helper to execute a GitHub REST API request.
+
+    The `token` kwarg is keyword-only (forces callers to be explicit about
+    which identity they authenticate as). When omitted, falls back to
+    _resolve_token() — which itself prefers GITHUB_REVIEWER_TOKEN.
+    """
+    resolved = _resolve_token(token)
     default_headers = {
-        "Authorization": f"token {token}",
+        "Authorization": f"token {resolved}",
         "Accept": "application/vnd.github.v3+json",
         "Content-Type": "application/json"
     }
     if headers:
         default_headers.update(headers)
-        
+
     url = f"{GITHUB_API_BASE}/{path.lstrip('/')}"
-    
+
     try:
         response = requests.request(method, url, headers=default_headers, json=data)
         response.raise_for_status()
-        
+
         # Handle special response formats (like diff)
         if "application/vnd.github.v3.diff" in default_headers.get("Accept", ""):
             return {"success": True, "data": response.text}
-            
+
         return {"success": True, "data": response.json() if response.text else {}}
     except Exception as e:
         logger.error(f"GitHub API Request Failed ({method} {path}): {e}")
         return {"success": False, "error": str(e)}
+
+
+def github_whoami(task_id: str = None) -> str:
+    """Return the GitHub identity that the current token resolves to.
+
+    Used by the Reviewer agent to verify, BEFORE calling github_approve_pr,
+    github_merge_pr, github_update_pr, or github_post_review_comment, that
+    it is NOT authenticated as the PR author (GitHub returns HTTP 422 on
+    self-approval). Token resolution order: GITHUB_REVIEWER_TOKEN first,
+    then GITHUB_TOKEN, then GH_TOKEN. The 'source' field in the response
+    tells you which env var was used.
+
+    The Reviewer's toolset is `[linear, github]` only — no terminal
+    access — so this is the only way the agent can verify identity from
+    inside its tool surface.
+    """
+    token = _resolve_token()
+    if not token:
+        return json.dumps({
+            "error": "No GitHub token configured (set GITHUB_TOKEN at minimum, ideally GITHUB_REVIEWER_TOKEN)",
+            "login": None, "source": None,
+        })
+
+    # Determine which env var won (for audit / debugging).
+    if os.getenv("GITHUB_REVIEWER_TOKEN") and token == os.getenv("GITHUB_REVIEWER_TOKEN"):
+        source = "GITHUB_REVIEWER_TOKEN"
+    elif os.getenv("GITHUB_TOKEN") and token == os.getenv("GITHUB_TOKEN"):
+        source = "GITHUB_TOKEN"
+    elif os.getenv("GH_TOKEN") and token == os.getenv("GH_TOKEN"):
+        source = "GH_TOKEN"
+    else:
+        source = "unknown"
+
+    result = _execute_github_request("GET", "user")
+    if not result.get("success"):
+        return json.dumps({
+            "error": result.get("error", "GitHub API request failed"),
+            "login": None, "source": source,
+        })
+
+    user = result.get("data") or {}
+    return json.dumps({
+        "login": user.get("login"),
+        "id": user.get("id"),
+        "name": user.get("name"),
+        "type": user.get("type"),
+        "source": source,
+    })
 
 # -----------------------------------------------------------------------------
 # Tool Handlers
@@ -106,13 +206,19 @@ def github_resolve_conflict(repo: str, pr_number: int, file_path: str, resolutio
     return json.dumps(result)
 
 def github_assign_pr(repo: str, pr_number: int, assignee: str, task_id: str = None) -> str:
-    """Assign a PR to a user."""
+    """Assign a PR to a user. Authenticated as the reviewer identity
+    (GITHUB_REVIEWER_TOKEN) so the assignment attribution reflects the
+    Reviewer role, not the author."""
     payload = {"assignees": [assignee]}
-    result = _execute_github_request("POST", f"repos/{repo}/issues/{pr_number}/assignees", data=payload)
+    result = _execute_github_request("POST", f"repos/{repo}/issues/{pr_number}/assignees", data=payload, token=_resolve_token())
     return json.dumps(result)
 
 def github_post_review_comment(repo: str, pr_number: int, body: str, commit_id: str = None, path: str = None, line: int = None, task_id: str = None) -> str:
-    """Post a review comment on a PR."""
+    """Post a review comment on a PR. Authenticated as the reviewer
+    identity (GITHUB_REVIEWER_TOKEN) so the comment attribution reflects
+    the Reviewer role. The PR's `/reviews` endpoint is also used here
+    for general PR comments (event: COMMENT), so the same identity-collision
+    concern as github_approve_pr applies."""
     if commit_id and path and line:
         # Inline comment
         payload = {
@@ -121,32 +227,35 @@ def github_post_review_comment(repo: str, pr_number: int, body: str, commit_id: 
             "path": path,
             "line": line
         }
-        result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/comments", data=payload)
+        result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/comments", data=payload, token=_resolve_token())
     else:
         # General PR review/comment
         payload = {
             "event": "COMMENT",
             "body": body
         }
-        result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/reviews", data=payload)
+        result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/reviews", data=payload, token=_resolve_token())
 
     return json.dumps(result)
 
 
 def github_approve_pr(repo: str, pr_number: int, body: str = "", task_id: str = None) -> str:
-    """Approve a Pull Request."""
+    """Approve a Pull Request. Authenticated as the reviewer identity
+    (GITHUB_REVIEWER_TOKEN) so it sidesteps GitHub's self-approval rule
+    (HTTP 422 when the approver identity equals the PR author)."""
     payload = {
         "event": "APPROVE",
         "body": body or "Code review approved. Ready for QA."
     }
-    result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/reviews", data=payload)
+    result = _execute_github_request("POST", f"repos/{repo}/pulls/{pr_number}/reviews", data=payload, token=_resolve_token())
     return json.dumps(result)
 
 
 def github_merge_pr(repo: str, pr_number: int, task_id: str = None) -> str:
-    """Merge a Pull Request into its base branch."""
+    """Merge a Pull Request into its base branch. Authenticated as the
+    reviewer identity (GITHUB_REVIEWER_TOKEN)."""
     payload = {"merge_method": "merge"}
-    result = _execute_github_request("PUT", f"repos/{repo}/pulls/{pr_number}/merge", data=payload)
+    result = _execute_github_request("PUT", f"repos/{repo}/pulls/{pr_number}/merge", data=payload, token=_resolve_token())
     return json.dumps(result)
 
 
@@ -155,9 +264,11 @@ def github_update_pr(repo: str, pr_number: int, ready_for_review: bool = True, t
 
     Set ready_for_review=True to mark the PR as OPEN (ready for review).
     Set ready_for_review=False to convert back to draft.
+
+    Authenticated as the reviewer identity (GITHUB_REVIEWER_TOKEN).
     """
     payload = {"draft": not ready_for_review}
-    result = _execute_github_request("PATCH", f"repos/{repo}/pulls/{pr_number}", data=payload)
+    result = _execute_github_request("PATCH", f"repos/{repo}/pulls/{pr_number}", data=payload, token=_resolve_token())
     return json.dumps(result)
 
 def github_get_pr(repo: str, pr_number: int, task_id: str = None) -> str:
@@ -487,6 +598,19 @@ registry.register(
         }
     },
     handler=lambda args, **kw: github_add_label(args.get("repo", ""), args.get("issue_number", 0), args.get("labels", []), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
+registry.register(
+    name="github_whoami",
+    toolset="github",
+    schema={
+        "name": "github_whoami",
+        "description": "Return the GitHub identity (login, id, name, type) of the token currently configured for GitHub API calls, plus which env var resolved ('GITHUB_REVIEWER_TOKEN' preferred, then 'GITHUB_TOKEN', then 'GH_TOKEN'). Use this BEFORE any mutating call (github_approve_pr, github_merge_pr, github_update_pr, github_post_review_comment, github_assign_pr) to verify the agent is NOT authenticated as the PR author — GitHub returns HTTP 422 on self-approval. The Reviewer agent's toolset is [linear, github] only (no terminal access), so this is the only way to verify identity from inside the agent.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    handler=lambda args, **kw: github_whoami(kw.get("task_id")),
     check_fn=check_github_requirements,
     requires_env=["GITHUB_TOKEN"],
 )

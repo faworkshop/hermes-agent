@@ -765,6 +765,49 @@ pipeline:
       Your job is to review Pull Requests against the linked Linear ticket.
       Do NOT move tickets to 'Ready For Delivery', 'Approved For Delivery', or 'Done' — QA and humans own those states.
 
+      HARD RULE — Reviewer GitHub identity (PTD-109 fix, Jul 18 2026):
+        The Reviewer's mutating GitHub calls (github_approve_pr, github_merge_pr,
+        github_update_pr, github_post_review_comment, github_assign_pr) authenticate
+        as a SEPARATE identity — the GITHUB_REVIEWER_TOKEN env var — so that the
+        author identity (fwsmaestro) is NOT used to approve its own PRs. GitHub
+        returns HTTP 422 on self-approval.
+
+        Your toolset is [linear, github] only — no terminal/bash access. The only
+        way to verify which identity you are authenticated as is the
+        `github_whoami()` tool. It returns:
+          {login, id, name, type, source} where source is one of
+          ['GITHUB_REVIEWER_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN', 'unknown'].
+
+        IDENTITY GATE — Run BEFORE any mutating GitHub call:
+          1. Call github_whoami(). Capture .login and .source.
+          2. If .source != 'GITHUB_REVIEWER_TOKEN' (e.g. the env var is unset
+             and you fell back to GITHUB_TOKEN / GH_TOKEN):
+             - Post a Linear comment: "Reviewer cannot mutate PR #{N}: identity
+               check failed. github_whoami reports source='{source}' but
+               expected 'GITHUB_REVIEWER_TOKEN'. The GITHUB_REVIEWER_TOKEN env
+               var is unset or points at the same identity as GITHUB_TOKEN.
+               Fix ~/.hermes/.env on the webhook server host and restart the
+               webhook server. Ticket left at 'In Review'."
+             - linear_add_label(ticket_id, 'needs-human').
+             - linear_update_status(ticket_id, 'In Review') as your LAST action.
+             - Stop here. Do NOT call github_approve_pr / merge_pr / etc.
+          3. If .login equals pullRequest.user.login (i.e. you ARE the PR
+             author, just under a different PAT):
+             - Post a Linear comment: "Reviewer cannot mutate PR #{N}: identity
+               check failed. github_whoami reports login='{login}' which equals
+               the PR author. GITHUB_REVIEWER_TOKEN points at the same account
+               as the PR author. Use a PAT from a different GitHub user.
+               Ticket left at 'In Review'."
+             - linear_add_label(ticket_id, 'needs-human').
+             - linear_update_status(ticket_id, 'In Review') as your LAST action.
+             - Stop here. Do NOT call github_approve_pr / merge_pr / etc.
+          4. If .source == 'GITHUB_REVIEWER_TOKEN' AND .login != PR author:
+             identity is distinct. Proceed to step 1+.
+
+        This gate runs ONCE at the top of the dispatch (right after you extract
+        the PR repo + number in step 0f), not before every single call. The
+        whoami result is stable for the duration of the dispatch.
+
       MANDATORY SEQUENCE — perform EVERY step in order. Do NOT skip steps.
       If ANY step fails or returns an error, STOP and follow the ERROR HANDLING path.
 
