@@ -455,6 +455,82 @@ pipeline:
          that point — your goal is to never trigger that path. Always convert the draft to OPEN
          first.
 
+         IS-DRAFT SEMANTIC CLARIFICATION (PTD-111 fix, Jul 18 2026):
+           PRs in this repo are created as OPEN by `gh pr create` and the
+           `github_create_pull_request` tool — NOT as drafts. A PR's default
+           state is `isDraft=false` from the moment it's opened. Step 5's
+           "Open a Pull Request on GitHub as a DRAFT PR" rule below is a
+           CONVENTION, not a default; you must explicitly opt in.
+
+           Correct mental model:
+             - PR starts OPEN (isDraft=false). CI is configured to run on PR open.
+             - You MAY keep it as OPEN from creation; CI will run immediately.
+             - You MAY convert it to DRAFT only if you want to gate CI while
+               you finish in-flight edits or wait for prior CI to clear. The
+               conversion requires a SEPARATE `gh pr ready --undo <N>` or
+               `github_update_pr(ready_for_review=False)` call after creation.
+             - When CI is SUCCESS: convert DRAFT → OPEN (ready_for_review=True)
+               so Reviewer can be dispatched. NEVER convert OPEN → DRAFT here.
+
+           Wrong mental model (what bit PTD-111):
+             - "PRs start as drafts and need to be promoted."  FALSE. The PR
+               starts OPEN. Calling `ready_for_review=False` to "set the draft
+               state" is INVERTED — it converts an already-open PR back to
+               draft (and the GitHub REST endpoint silently no-ops on this
+               direction, verified Jul 3 2026). Result: ticket stranded.
+
+           If you want a true draft during dev iteration:
+             1. Create the PR open with `gh pr create --draft` (or
+                `github_create_pull_request(..., draft=True)`).
+             2. When ready for review: `gh pr ready <N>` (or
+                `github_update_pr(ready_for_review=True)`).
+             3. Do NOT use `gh pr ready --undo` to revert an open PR unless
+                you genuinely want to pause CI; the inverse is fragile.
+
+         HARD EXIT GATE (PTD-111 fix, Jul 18 2026 — runs as the absolute
+         last verification BEFORE the FINAL EXIT CHECK below; you must NOT
+         skip this even on iteration-cap exit):
+
+           Before calling `linear_update_status` (or declaring done), run
+           these four checks. ANY failure here means you have more work to
+           do in this session — do NOT exit cleanly. Continue to the
+           recovery path; do not move the ticket.
+
+             1. `gh pr view <N> --json isDraft --jq '.isDraft'`
+                  MUST be `false` once CI is SUCCESS.
+                  If `true` and CI is SUCCESS: run the step 7a recovery
+                  (idempotent retry with 2s/5s/10s backoff). If the recovery
+                  fails, post a comment + add `needs-human` + move to
+                  'In Progress' (NOT 'In Review') + exit.
+
+             2. `gh pr view <N> --json mergeable --jq '.mergeable'`
+                  MUST NOT be `CONFLICTING`. If CONFLICTING: STOP the
+                  In-Review transition. Run STEP 0.5 (rebase develop into
+                  feature branch, push with --force-with-lease), re-run
+                  local tests, then re-check this gate. Do not call
+                  `linear_update_status('In Review')` on a CONFLICTING PR —
+                  the Reviewer dispatch will fail and the ticket will loop.
+
+             3. `git fetch origin develop >/dev/null 2>&1 && git log --oneline HEAD..origin/develop | wc -l`
+                  MUST be `0`. If develop has commits not on your branch:
+                  run STEP 0.5 conflict resolution BEFORE the In-Review
+                  transition. Skipping this step is the #1 cause of
+                  "PR is OPEN, isDraft=false, but CONFLICTING at merge
+                  time" — a waste of a Reviewer dispatch.
+
+             4. `gh pr view <N> --json statusCheckRollup --jq '.statusCheckRollup | map(select(.conclusion == \"SUCCESS\")) | length'`
+                  MUST be `> 0` AND equal to the total check count
+                  (`gh pr view <N> --json statusCheckRollup --jq '.statusCheckRollup | length'`).
+                  If 0 checks ran: your PR is likely still DRAFT or the
+                  workflow trigger excludes this branch — fix and re-check.
+                  If some checks failed: this is the (B) path in step 6,
+                  not the (C) path — fix locally and re-push.
+
+           If you reach this gate with the PR OPEN, non-conflicting, and
+           CI green, AND you have the gate-output values recorded: the
+           In-Review transition is safe. Otherwise, continue the recovery
+           path and re-attempt the gate.
+
          FINAL EXIT CHECK (mandatory, run as your absolute last thought before stopping):
            - Has `linear_update_status` been called in this session?
              - YES, to 'CI in Progress' → exit cleanly. CI-poll will move to 'In Review' once CI passes.
@@ -630,6 +706,46 @@ pipeline:
           - VERIFY post-call: re-fetch the PR; confirm isDraft is now FALSE. If still
             draft, fall back to the failure path above. NEVER move the ticket to
             'In Review' while the PR is still a draft.
+
+        isDraft mental model (PTD-111 fix, Jul 18 2026 — the bit that confused
+        the previous dispatch): PRs in this repo are CREATED OPEN, not as drafts.
+        `gh pr create` and `github_create_pull_request` both default to
+        isDraft=false. When you see a PR with isDraft=false, that is the
+        NORMAL post-creation state — do NOT call `ready_for_review=False` to
+        "set" a draft flag, that inverts the state. To create a true draft
+        use `gh pr create --draft` (or `draft=True` on the create tool) and
+        to promote a draft to open use `gh pr ready <N>`. The inverse
+        (open → draft) is fragile: the GitHub REST PATCH silently no-ops in
+        that direction, and `gh pr ready --undo` is fine but the agent
+        should not invoke it speculatively.
+
+        HARD EXIT GATE (PTD-111 fix, Jul 18 2026 — must run before
+        `linear_update_status`; the agent must not exit cleanly without it):
+
+          Before moving the ticket to 'In Review', verify all four:
+            1. `gh pr view <N> --json isDraft --jq '.isDraft'` is `false`
+               (if true, run the step 7a recovery above; on persistent
+               failure, move to 'In Progress' + add `needs-human` + exit).
+            2. `gh pr view <N> --json mergeable --jq '.mergeable'`
+               is NOT `CONFLICTING` (if CONFLICTING, run STEP 0.5 to
+               rebase + push, then re-check).
+            3. `git fetch origin develop >/dev/null 2>&1 && git log
+               --oneline HEAD..origin/develop | wc -l` is `0`
+               (if non-zero, develop is ahead — rebase/merge before
+               transitioning to In Review, otherwise the Reviewer dispatch
+               will fail on a CONFLICTING PR at merge time).
+            4. `gh pr view <N> --json statusCheckRollup --jq
+               '.statusCheckRollup | map(select(.conclusion == "SUCCESS"))
+               | length'` is `> 0` AND equal to the total check count
+               (otherwise CI did not actually run or did not pass — fix
+               and re-push before transitioning).
+
+          If any of the four fails: do NOT call `linear_update_status`.
+          Either fix the underlying state in this session, OR post a
+          Linear comment describing the failure, add `needs-human`, move
+          to 'In Progress' (NOT 'In Review'), and exit cleanly. The
+          next Developer dispatch will pick up from the same state and
+          can retry.
 
       IMPORTANT — mandatory exit rule:
         - CI SUCCESS and PR ready → move to 'In Review'
