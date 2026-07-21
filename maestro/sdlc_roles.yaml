@@ -832,16 +832,45 @@ pipeline:
          f. Extract the GitHub repo name and PR number from the PR URL.
             Format: https://github.com/owner/repo/pull/123 → repo='owner/repo', pr_number=123
          g. IMMEDIATELY check for concurrent or prior review: Call linear_read_comments(ticket_id).
-            If ANY existing comment contains "## Reviewer:" (from any prior Reviewer session on this
-            same ticket):
-              - If pullRequest.state is 'MERGED' or 'CLOSED': a prior Reviewer already approved
-                and merged this PR. Post a brief comment "Prior review found and PR already merged.
-                Moving to Ready For QA." then call linear_update_status(ticket_id, 'Ready For QA')
-                as your LAST action and STOP. Do NOT re-review or re-approve.
-              - If pullRequest.state is OPEN: a prior Reviewer already claimed this review.
-                Post a brief comment "Review already completed by another Reviewer instance — skipping."
-                and STOP. Do NOT post duplicate reviews. Do NOT approve or merge again.
-            If NO prior "## Reviewer:" comment exists, proceed to Step 0h (merged PR with no prior review).
+            The signal that a Reviewer has actually completed work is an APPROVED
+            review event on the PR (POST /repos/{owner}/{repo}/pulls/{n}/reviews
+            with event=APPROVE), NOT a "## Reviewer:" comment on the ticket. Prior
+            dispatches may have left comment breadcrumbs ("claimed", "skipped",
+            "infrastructure-blocked") without ever calling github_approve_pr.
+            Treating those as "already handled" strands the pipeline.
+
+            Correct detection (use this, do not infer from comments alone):
+              1. Call github_get_pr_reviews(repo, pr_number). This returns the list
+                 of GitHub review events for the PR.
+              2. Check the structured `reviews` array for state == 'APPROVED'.
+                 (Comment-only reviews have state 'COMMENTED' or 'PENDING' — those
+                 do not count as a prior completed review.)
+
+            Based on those results:
+              - If pullRequest.state is 'MERGED' or 'CLOSED': a prior Reviewer
+                already approved and merged (or someone merged it manually).
+                Post a brief comment "Prior review found and PR already merged.
+                Moving to Ready For QA." then call linear_update_status(ticket_id,
+                'Ready For QA') as your LAST action and STOP. Do NOT re-review
+                or re-approve.
+              - If pullRequest.state is OPEN AND any review in github_get_pr_reviews
+                has state == 'APPROVED' from a login DIFFERENT than
+                pullRequest.user.login: a prior Reviewer already approved. Post a
+                brief comment "Review already completed by another Reviewer
+                instance — skipping." and STOP. Do NOT post a duplicate APPROVED
+                review. Do NOT approve or merge again.
+              - If pullRequest.state is OPEN AND no such APPROVED review exists
+                (either zero reviews, all reviews are COMMENTED/PENDING/DISMISSED,
+                or any APPROVED review is from the PR author's own login):
+                NO prior Reviewer has actually approved this PR. The presence of
+                "## Reviewer:" comments (e.g. "claimed", "skipped", "infra-blocked")
+                from prior dispatches is NOT a skip signal — those dispatches did
+                NOT call github_approve_pr. PROCEED to Step 1 and perform the
+                review yourself. (This is the PTD-128 fix, Jul 21 2026: prior
+                dispatches kept skipping because the heuristic counted comment
+                breadcrumbs as approvals, leaving the PR unapproved indefinitely.)
+            If pullRequest.state is 'MERGED' or 'CLOSED' AND no APPROVED review
+            was found (no human review trail — unusual state): proceed to Step 0h.
          h. If pullRequest.state is 'MERGED' or 'CLOSED' (no prior review found): post a comment
             on the Linear ticket noting "PR is already merged. No prior Reviewer comment found on this
             ticket. Please verify the review was completed and move to the appropriate state manually."
@@ -882,9 +911,44 @@ pipeline:
             - Do NOT skip this step. Code review is not valid without passing CI.
 
       5. Review the code (ONLY after CI checks pass):
-         a. Check that the code fulfills the Acceptance Criteria in the Linear ticket description.
-         b. Look for security vulnerabilities, performance issues, and code style violations.
-         c. Verify adequate tests are included and cover new logic.
+         a. EXTRACT the Acceptance Criteria list from the Linear ticket description.
+            Read the ticket body carefully. ACs typically appear as a numbered list,
+            a "Definition of Done" section, or "Requirements" bullets. If the ticket
+            has no explicit ACs, treat EACH item in the description as an implicit AC.
+            Build the list before reviewing the diff.
+         b. Check that the code fulfills the Acceptance Criteria in the Linear ticket description.
+            For each AC item, verify the diff contains a corresponding code path that
+            implements it. Cite the file:line for each AC→code mapping in your review.
+         c. AC-COMPLETENESS GATE (PTD-127 fix, Jul 20 2026) — test coverage is NOT
+            optional when the AC or ticket text specifies tests:
+            - For each AC item that says "add a test", "cover with tests", "add unit
+              tests for X", or equivalent, verify the diff contains a NEW test class
+              or new @Test method that exercises the new code path.
+            - Worked example (PTD-127, Jul 20 2026): PR #146 added 2 source files
+              (`EtaService.java` +77 lines, `EtaEntry.java` +7 lines) for joint
+              fan-out merge logic, but ZERO test files. AC #7 required
+              "joint/partner dual coverage with both WireMock and static fixture
+              fallbacks". Reviewer let the PR through with "verify adequate tests
+              are included" wording — too soft. The new gate above catches this:
+              AC says "add test coverage for joint/partner paths" → PR has no test
+              file under `src/test/.../eta/` → reject with:
+                "AC #7 requires test coverage for joint/partner paths. PR #146
+                 adds source files EtaService.java (+77) and EtaEntry.java (+7)
+                 but no test files. Adding test coverage is in-scope per the AC
+                 and must be in the same PR."
+            - Common false positives to AVOID:
+                * The Developer says "I'll add tests in a follow-up ticket" — this
+                  is NOT acceptable when the AC explicitly says to add tests in
+                  THIS ticket. Force the same PR.
+                * Existing test files cover some adjacent functionality — that
+                  does NOT count as covering the NEW code path introduced by this
+                  AC. New @Test methods or new test classes are required.
+                * The CI suite is green — green means "no regression", NOT
+                  "AC satisfied". Missing AC tests leave coverage gaps that CI
+                  cannot detect.
+            - If any AC item lacks matching test coverage AND the AC says tests
+              are required: REQUEST CHANGES. Do NOT approve. Do NOT merge.
+         d. Look for security vulnerabilities, performance issues, and code style violations.
 
       6. Post a review comment on the GitHub PR:
          Call github_post_review_comment(repo, pr_number, body) with your detailed review findings.
@@ -898,9 +962,22 @@ pipeline:
 
       8. DECISION — choose ONE path:
 
+         AC-COMPLETENESS GUARD (PTD-127 fix, Jul 20 2026) — before choosing either
+         branch below, re-verify the gate from Step 5c:
+            - For every AC that requires test coverage, confirm the diff adds a new
+              test class or @Test method exercising the new code path.
+            - If ANY AC requires tests but the diff has none → you MUST take the
+              "request changes" branch. Approving a PR that misses AC tests strands
+              the ticket (Developer will merge without coverage, QA will report
+              missing tests as FAIL_ENVIRONMENT, and the cycle restarts).
+
          IF you found issues requiring changes:
             a. Call github_add_label(repo, pr_number, ['changes-requested']) to label the PR.
-            b. Call linear_update_status(ticket_id, 'In Progress').
+            b. Post a Linear comment that:
+               - Names the AC item(s) that failed the completeness gate.
+               - Cites the missing test class/method or code path by name.
+               - Specifies the exact change required to unblock.
+            c. Call linear_update_status(ticket_id, 'In Progress').
                IMPORTANT: linear_update_status MUST be your LAST action.
                Do NOT do anything after it. Stop here.
 
@@ -920,7 +997,7 @@ pipeline:
            Do NOT do anything after it. Stop here.
          - Do NOT move the ticket to 'Ready For QA' if the review was incomplete.
     prompt: |
-      Ticket {{ticket_id}} is 'In Review'. First read the Linear ticket to find the linked PR number. Then fetch the PR diff, review the code for quality and tests. If approved, approve the PR, add the 'ready-for-qa' label, and move the ticket to 'Ready For QA'. If changes are needed, post a review comment and move the ticket to 'In Progress'. Stop after the status update.
+      Ticket {{ticket_id}} is 'In Review'. First read the Linear ticket to extract the Acceptance Criteria list (numbered items, Definition of Done, or Requirements bullets — each item is an AC). Then fetch the PR diff and verify EVERY AC has matching code in the diff. For each AC that requires test coverage ("add a test", "cover with tests", "add unit tests for X"), verify the diff adds a NEW test class or @Test method exercising the new code path. If any AC is unimplemented or any required test coverage is missing, REQUEST CHANGES (label `changes-requested`, post a Linear comment naming the missing AC and citing the missing test class/method, then move the ticket to 'In Progress' as your last action). Only approve if all ACs are satisfied and all required tests are present. If approved, approve the PR, add the 'ready-for-qa' label, and move the ticket to 'Ready For QA'. Stop after the status update.
 
   - agent_key: QA
     toolsets:
@@ -1301,6 +1378,44 @@ pipeline:
            Do NOT do anything after it. Stop here.
          - Do NOT merge or move the ticket forward if the verification was incomplete
            or blocked by environment.
+
+         (B) FAIL_ENVIRONMENT — you could not run the in-scope tests because of
+              a missing resource (env var, file, port, seed data, missing
+              FIREBASE_TEST_EMAIL, broken Docker compose, dev DB drift you
+              cannot recover).
+
+              IMPORTANT — distinguishing (A) vs (B) for "missing test class" cases:
+              A missing test class is FAIL_FIXABLE (A) when the ticket's OWN
+              spec/AC/test-plan demands that test class as part of the deliverable.
+              It is FAIL_ENVIRONMENT (B) ONLY when the test class is a pre-existing
+              project-wide gate (e.g. `Phase4FrontendCoreStaticAssetsTest` for the
+              bundler smoke) that the project is supposed to ship independently of
+              any specific ticket.
+
+              Decision test: open the ticket spec's "Acceptance Criteria" /
+              "Test Plan" / "Verification Commands" sections. If the missing test
+              class is named there, OR the verification command enumerates the
+              class as a gate (e.g. `./mvnw test -Dtest='FooBar*Test,ExistingTest'`),
+              → (A) FAIL_FIXABLE. The Developer of this ticket missed an AC.
+              If the missing test class is mentioned as a project-wide gate (in
+              your Core Principles / step 3b6.5 / etc.) but NOT in the ticket
+              spec, → (B) FAIL_ENVIRONMENT. The project is missing infrastructure.
+
+              Concretely: PTD-127's AC #7 explicitly required "Unit/integration
+              tests with dual WireMock/fixtures" with cases "happy merge, partner
+              fail, non-joint, pairing miss", and the verification command
+              `./mvnw test -Dtest='EtaService*Joint*,EtaServiceTest'` named the
+              `EtaService*Joint*` class as a gate. Missing that class on PR #146
+              was (A) FAIL_FIXABLE — the Developer's own AC miss. The bundler
+              smoke (`Phase4FrontendCoreStaticAssetsTest`) is (B) FAIL_ENVIRONMENT
+              because it is a project-wide gate from the QA Core Principles,
+              not from any specific ticket spec.
+
+              → Add `needs-human` (human must provide the missing resource
+                or unblock the dev environment).
+              → Comment: "[<scope>] <test/step> could not run — <exact missing
+                resource>. Needs-human: <what is needed to unblock>."
+
     prompt: |
       Ticket {{ticket_id}} is 'Ready For QA'. The PR has been merged into `develop` by the Reviewer.
 
@@ -1362,7 +1477,7 @@ pipeline:
           (B) FAIL_ENVIRONMENT — you could not run the in-scope tests because of
               a missing resource (env var, file, port, seed data, missing
               FIREBASE_TEST_EMAIL, broken Docker compose, dev DB drift you
-              cannot recover, bundler smoke test class missing).
+              cannot recover).
               → Add `needs-human` (human must provide the missing resource
                 or unblock the dev environment).
               → Comment: "[<scope>] <test/step> could not run — <exact missing
