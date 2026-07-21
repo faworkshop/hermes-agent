@@ -1090,7 +1090,10 @@ pipeline:
 
       4. BUNDLER RUNTIME SMOKE IS MANDATORY FOR ANY FRONTEND-TOUCHING TICKET.
          node:test with `PT_FIREBASE_STUB=1` / `PT_AUTH_STUB=***` does NOT verify
-         that the Quarkus Web Bundler actually emitted `/static/bundle/main.js`
+         that the Quarkus Web Bundler actually emitted `/static/bundle/main-*.js`
+         (note: v1.5.x content-hashes the bundle filename; the canonical
+         `/static/bundle/main.js` URL does NOT resolve in dev mode — scrape the
+         served URL from the rendered HTML)
          or that the PostCSS/Tailwind pipeline actually processed `@tailwind`
          directives. The post-merge blank-SPA regression and the unprocessed-
          `@tailwind` regression both slipped through node:test on Phase 4 tickets
@@ -1173,16 +1176,34 @@ pipeline:
                       `postcss.config.js`, `tailwind.config.js`).
                       Run all of:
                         (i)   `./mvnw -B test -Dtest=Phase4FrontendCoreStaticAssetsTest`
-                              (or the closest equivalent test class that boots Quarkus
-                              and asserts `/static/bundle/main.js` + `/static/bundle/main.css`
-                              are served). If the test class does not exist, FAIL the
-                              ticket with a comment naming that as a missing gate.
-                        (ii)  `curl -sf http://localhost:8081/static/bundle/main.css | \
-                              grep -q '@tailwind' && echo FAIL || echo OK`
-                              — FAIL if `@tailwind` is in the served CSS (PostCSS/Tailwind
-                              pipeline is broken and the directives leaked through).
-                        (iii) `curl -sf -o /dev/null -w "%{http_code}\n" \
-                              http://localhost:8081/static/bundle/main.js` → must print `200`.
+                              (or the closest equivalent test class that exercises the
+                              frontend static-asset contract). If the test class does not
+                              exist, FAIL the ticket with a comment naming that as a
+                              missing gate.
+                        (ii)  **SCRAPE the served asset URLs from the rendered SPA shell
+                              rather than assuming canonical filenames.** In dev mode
+                              Quarkus Web Bundler 1.5.x serves bundles under
+                              content-hashed filenames (`main-<HASH>.js`,
+                              `main-<HASH>.css`, `chunk-<HASH>.js`,
+                              `auth-helpers-<HASH>.js`) — the canonical
+                              `/static/bundle/main.js` URL does NOT resolve. Use:
+                              ```bash
+                              HTML=$(curl -sf http://localhost:8081/)
+                              JS_URL=$(echo "$HTML" | grep -oE '/static/bundle/main-[A-Z0-9]+\.js' | head -1)
+                              CSS_URL=$(echo "$HTML" | grep -oE '/static/bundle/main-[A-Z0-9]+\.css' | head -1)
+                              curl -sf "$JS_URL" | head -c 50 && echo "JS_OK"
+                              curl -sf "$CSS_URL" | grep -q '@tailwind' && echo "CSS_FAIL" || echo "CSS_OK"
+                              curl -sf -o /dev/null -w '%{http_code}\n' "http://localhost:8081$JS_URL"  # expect 200
+                              curl -sf -o /dev/null -w '%{http_code}\n' "http://localhost:8081$CSS_URL" # expect 200
+                              ```
+                              FAIL if `JS_OK` is empty (bundle not served), `CSS_FAIL`
+                              (PostCSS/Tailwind pipeline leaked through), or either
+                              status code is not `200`. The hash changes on every build,
+                              so do NOT hard-code `/static/bundle/main.js` in the smoke.
+                        (iii) `curl -sf http://localhost:8081/ | grep -q 'static/bundle/main-'`
+                              — the served HTML must reference the hashed bundle path
+                              (catches the blank-SPA regression where the SPA fails to
+                              mount).
                       If the dev server is not already running, start it: `docker compose up -d
                       postgres && ./mvnw quarkus:dev &` then wait for `Listening on: http://0.0.0.0:8081`.
                       If you cannot run the smoke (env failure, port conflict, missing test
@@ -1203,19 +1224,34 @@ pipeline:
                b6.5. (BUNDLER RUNTIME SMOKE — ALWAYS required for frontend-only tickets;
                       see Core Principle #4). Run all of:
                         (i)   `./mvnw -B test -Dtest=Phase4FrontendCoreStaticAssetsTest`
-                              (or the closest equivalent test class that boots Quarkus
-                              and asserts `/static/bundle/main.js` + `/static/bundle/main.css`
-                              are served). If the test class does not exist, FAIL the
-                              ticket with a comment naming that as a missing gate.
-                        (ii)  `curl -sf http://localhost:8081/static/bundle/main.css | \
-                              grep -q '@tailwind' && echo FAIL || echo OK`
-                              — FAIL if `@tailwind` is in the served CSS (PostCSS/Tailwind
-                              pipeline is broken and the directives leaked through).
-                        (iii) `curl -sf -o /dev/null -w "%{http_code}\n" \
-                              http://localhost:8081/static/bundle/main.js` → must print `200`.
-                        (iv)  `curl -sf http://localhost:8081/ | grep -q 'static/bundle/main.js'`
-                              — the served HTML must reference the bundle (catches the
-                              blank-SPA regression where the SPA fails to mount).
+                              (or the closest equivalent test class that exercises the
+                              frontend static-asset contract). If the test class does not
+                              exist, FAIL the ticket with a comment naming that as a
+                              missing gate.
+                        (ii)  **SCRAPE the served asset URLs from the rendered SPA shell
+                              rather than assuming canonical filenames.** In dev mode
+                              Quarkus Web Bundler 1.5.x serves bundles under
+                              content-hashed filenames (`main-<HASH>.js`,
+                              `main-<HASH>.css`, `chunk-<HASH>.js`,
+                              `auth-helpers-<HASH>.js`) — the canonical
+                              `/static/bundle/main.js` URL does NOT resolve. Use:
+                              ```bash
+                              HTML=$(curl -sf http://localhost:8081/)
+                              JS_URL=$(echo "$HTML" | grep -oE '/static/bundle/main-[A-Z0-9]+\.js' | head -1)
+                              CSS_URL=$(echo "$HTML" | grep -oE '/static/bundle/main-[A-Z0-9]+\.css' | head -1)
+                              curl -sf "$JS_URL" | head -c 50 && echo "JS_OK"
+                              curl -sf "$CSS_URL" | grep -q '@tailwind' && echo "CSS_FAIL" || echo "CSS_OK"
+                              curl -sf -o /dev/null -w '%{http_code}\n' "http://localhost:8081$JS_URL"  # expect 200
+                              curl -sf -o /dev/null -w '%{http_code}\n' "http://localhost:8081$CSS_URL" # expect 200
+                              ```
+                              FAIL if `JS_OK` is empty (bundle not served), `CSS_FAIL`
+                              (PostCSS/Tailwind pipeline leaked through), or either
+                              status code is not `200`. The hash changes on every build,
+                              so do NOT hard-code `/static/bundle/main.js` in the smoke.
+                        (iii) `curl -sf http://localhost:8081/ | grep -q 'static/bundle/main-'`
+                              — the served HTML must reference the hashed bundle path
+                              (catches the blank-SPA regression where the SPA fails to
+                              mount).
                       Start the dev server first if needed: `docker compose up -d postgres && \
                       ./mvnw quarkus:dev &` then wait for `Listening on: http://0.0.0.0:8081`.
                       If you cannot run the smoke, that is a FAIL per Core Principle #2 —
@@ -1264,13 +1300,19 @@ pipeline:
                b7. (BUNDLER RUNTIME SMOKE — always required for fullstack tickets; see
                     Core Principle #4). The Playwright run already touches the live
                     HTML/JS/CSS, so the bundle/PostCSS checks are partially covered
-                    (a missing main.js would 404 in the browser). Still, for fullstack
-                    tickets, additionally verify:
-                      (i)  `curl -sf http://localhost:8081/static/bundle/main.css | \
-                           grep -q '@tailwind' && echo FAIL || echo OK`
-                           — FAIL if `@tailwind` is in the served CSS.
-                      (ii) `curl -sf -o /dev/null -w "%{http_code}\n" \
-                           http://localhost:8081/static/bundle/main.js` → must print `200`.
+                    (a missing `main-*.js` would 404 in the browser). Still, for fullstack
+                    tickets, additionally verify — scraping the served URLs from the
+                    rendered SPA shell rather than assuming canonical filenames, since
+                    Quarkus Web Bundler 1.5.x serves bundles under content-hashed URLs:
+                      (i)  ```bash
+                           HTML=$(curl -sf http://localhost:8081/)
+                           CSS_URL=$(echo "$HTML" | grep -oE '/static/bundle/main-[A-Z0-9]+\.css' | head -1)
+                           curl -sf "$CSS_URL" | grep -q '@tailwind' && echo "CSS_FAIL" || echo "CSS_OK"
+                           JS_URL=$(echo "$HTML" | grep -oE '/static/bundle/main-[A-Z0-9]+\.js' | head -1)
+                           curl -sf -o /dev/null -w '%{http_code}\n' "http://localhost:8081$JS_URL"  # expect 200
+                           ```
+                           FAIL on `CSS_FAIL` (PostCSS/Tailwind pipeline leaked
+                           through) or any non-`200` status code.
 
          c. POST the actual test output to Linear via linear_post_comment BEFORE step 4.
             The comment MUST include:
