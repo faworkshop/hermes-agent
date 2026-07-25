@@ -15,20 +15,30 @@ def check_github_requirements() -> bool:
     """Check if GitHub integration is configured."""
     return bool(os.getenv("GITHUB_TOKEN"))
 
-
 def _resolve_token(explicit: Optional[str] = None) -> str:
-    """Resolve which GitHub PAT to use.
+    """
+    Resolve which GitHub PAT to use.
 
     Priority: explicit kwarg > GITHUB_REVIEWER_TOKEN > GITHUB_TOKEN > GH_TOKEN.
 
-    The Reviewer mutating tools (github_approve_pr, github_merge_pr,
-    github_update_pr, github_post_review_comment) pass _resolve_token() so
-    they authenticate as a distinct identity (the reviewer bot) and
-    sidestep GitHub's self-approval rule (HTTP 422 when the approver
-    identity equals the PR author). The 12 read-side tools keep passing
-    nothing and fall back to GITHUB_TOKEN (the author identity) — that's
-    correct because they don't mutate PR state in a way that triggers
-    the rule.
+    Designed for Reviewer mutating tools (github_approve_pr, github_merge_pr,
+    github_update_pr, github_post_review_comment, github_assign_pr) which
+    pass _resolve_token() with no argument so they authenticate as a distinct
+    identity (the reviewer bot) and sidestep GitHub's self-approval rule
+    (HTTP 422 when the approver identity equals the PR author).
+
+    !! DO NOT use _resolve_token() with no argument for AUTHOR-side tools
+       (github_open_pr, github_create_branch, github_resolve_conflict).
+       Those must explicitly pass token=os.getenv("GITHUB_TOKEN")
+       so the PR / branch / commit is attributed to the author identity
+       (fwsmaestro), NOT the reviewer bot. Otherwise the FAW-62 identity
+       split is violated and the Reviewer hits self-approval 422 on its own
+       PR (PTD-126 root cause, Jul 20 2026).
+    NOTE: Reviewer-side label/comment tools (github_add_label) SHOULD pass
+       token=_resolve_token() explicitly so the reviewer identity is the
+       actor. Passing nothing relies on _resolve_token()'s reviewer-first
+       default which is the intended behavior but couples them to that
+       ordering.
 
     Falls back to GITHUB_TOKEN SILENTLY if the reviewer token is unset —
     see the module-level warning below emitted at import time so the
@@ -159,18 +169,24 @@ def github_create_branch(repo: str, branch_name: str, base_branch: str = "main",
         "ref": f"refs/heads/{branch_name}",
         "sha": sha
     }
-    result = _execute_github_request("POST", f"repos/{repo}/git/refs", data=payload)
+    result = _execute_github_request("POST", f"repos/{repo}/git/refs", data=payload, token=os.getenv("GITHUB_TOKEN"))
     return json.dumps(result)
 
 def github_open_pr(repo: str, title: str, head: str, base: str = "main", body: str = "", task_id: str = None) -> str:
-    """Open a pull request on GitHub."""
+    """Open a pull request on GitHub. Authored as the author identity
+    (GITHUB_TOKEN) so the PR's author login matches the committer — NOT
+    the reviewer bot. The FAW-62 identity split requires the author
+    and reviewer to be distinct GitHub users; if this is opened as the
+    reviewer bot, the Reviewer agent will hit self-approval HTTP 422
+    when trying to approve its own PR (PTD-126 root cause, Jul 20 2026).
+    """
     payload = {
         "title": title,
         "head": head,
         "base": base,
         "body": body
     }
-    result = _execute_github_request("POST", f"repos/{repo}/pulls", data=payload)
+    result = _execute_github_request("POST", f"repos/{repo}/pulls", data=payload, token=os.getenv("GITHUB_TOKEN"))
     return json.dumps(result)
 
 def github_read_diff(repo: str, pr_number: int, task_id: str = None) -> str:
@@ -202,7 +218,7 @@ def github_resolve_conflict(repo: str, pr_number: int, file_path: str, resolutio
     }
     if sha: payload["sha"] = sha
     
-    result = _execute_github_request("PUT", f"repos/{repo}/contents/{file_path}", data=payload)
+    result = _execute_github_request("PUT", f"repos/{repo}/contents/{file_path}", data=payload, token=os.getenv("GITHUB_TOKEN"))
     return json.dumps(result)
 
 def github_assign_pr(repo: str, pr_number: int, assignee: str, task_id: str = None) -> str:
@@ -335,10 +351,45 @@ def github_get_pr_checks(repo: str, pr_number: int, task_id: str = None) -> str:
         cr_data["check_runs"] = cr_data.get("check_runs", [])
     return json.dumps(cr_data)
 
+
+def github_get_pr_reviews(repo: str, pr_number: int, task_id: str = None) -> str:
+    """Get the structured list of Pull Request review events for a PR.
+
+    Returns the GitHub reviews array — each entry has `id`, `user.login`,
+    `state` (one of 'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED',
+    'PENDING'), `submitted_at`, and `body`.
+
+    Used by the Reviewer agent's Step 0g concurrent/prior-review check to
+    distinguish an actual APPROVE event (which means "another Reviewer
+    completed this review") from mere comment breadcrumbs like "claimed" /
+    "skipped" / "infra-blocked" on the Linear ticket. Without this signal,
+    the agent would skip every re-dispatch after a previous agent failed
+    to actually approve.
+
+    Read-only — uses default GITHUB_TOKEN (anyone can read public reviews),
+    no token override required.
+
+    Aliases on the registry: `get_pr_reviews`, `github_list_pr_reviews`.
+    """
+    result = _execute_github_request("GET", f"repos/{repo}/pulls/{pr_number}/reviews")
+    data = result.get("data", {}) if isinstance(result, dict) else result
+    # Normalize: ensure top-level `reviews` key exists even on empty responses
+    if isinstance(data, dict) and "reviews" not in data:
+        # GitHub returns the array directly when success; wrap for consistency
+        if isinstance(data, list):
+            data = {"reviews": data}
+        else:
+            data = {"reviews": []}
+    return json.dumps(data)
+
+
 def github_add_label(repo: str, issue_number: int, labels: List[str], task_id: str = None) -> str:
-    """Add labels to a PR or Issue. Used by Reviewer to trigger QA."""
+    """Add labels to a PR or Issue. Used by Reviewer to trigger QA.
+    Authenticated as the reviewer identity (token=_resolve_token()) so the
+    label attribution reflects the Reviewer / QA role, not the author.
+    """
     payload = {"labels": labels}
-    result = _execute_github_request("POST", f"repos/{repo}/issues/{issue_number}/labels", data=payload)
+    result = _execute_github_request("POST", f"repos/{repo}/issues/{issue_number}/labels", data=payload, token=_resolve_token())
     return json.dumps(result)
 
 # -----------------------------------------------------------------------------
@@ -580,6 +631,28 @@ registry.register(
     requires_env=["GITHUB_TOKEN"],
     max_result_size_chars=float("inf"),
 )
+
+
+registry.register(
+    name="github_get_pr_reviews",
+    toolset="github",
+    schema={
+        "name": "github_get_pr_reviews",
+        "description": "Get the list of Pull Request review events for a PR. Each entry has user.login, state ('APPROVED'|'CHANGES_REQUESTED'|'COMMENTED'|'DISMISSED'|'PENDING'), submitted_at, and body. Use to detect whether a prior Reviewer dispatch actually called github_approve_pr (state=APPROVED) — as opposed to merely leaving a '## Reviewer:' comment on the Linear ticket. Read-only; uses default GITHUB_TOKEN.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Repository in format owner/repo."},
+                "pr_number": {"type": "integer", "description": "The PR number."},
+            },
+            "required": ["repo", "pr_number"]
+        }
+    },
+    handler=lambda args, **kw: github_get_pr_reviews(args.get("repo", ""), args.get("pr_number", 0), kw.get("task_id")),
+    check_fn=check_github_requirements,
+    requires_env=["GITHUB_TOKEN"],
+)
+
 
 registry.register(
     name="github_add_label",

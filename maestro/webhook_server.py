@@ -2711,7 +2711,7 @@ async def linear_webhook(request: Request):
             return _log_ignored("CI-Poll: no branch/PR found for ticket", ticket=ticket_id)
 
     linear_issue_uuid = _linear_issue_uuid_for_api(data, ticket_id)
-    if role in {"Developer", "Reviewer", "QA"}:
+    if role in {"Developer", "Product Manager", "Reviewer", "QA"}:
         if not linear_issue_uuid:
             logger.warning(
                 "Cannot resolve Linear issue UUID for identifier=%r — skipping AI-Ready check "
