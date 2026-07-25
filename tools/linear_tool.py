@@ -297,7 +297,22 @@ def linear_assign_user(ticket_id: str, user_id: str, task_id: str = None) -> str
     return json.dumps(result)
 
 def linear_add_label(ticket_id: str, label_id: str, task_id: str = None) -> str:
-    """Add a label to a Linear ticket. Supports label name or ID."""
+    """Add a label to a Linear ticket. Supports label name or ID.
+
+    The ``label_id`` argument is resolved against the ticket's team labels
+    (case-insensitive name match, or exact UUID match). When the value looks
+    like a UUID (hex-with-dashes, ~36 chars) and does not match any team label,
+    or when it is a name that does not exist on the team, the tool returns a
+    ``{"success": False, "resolved": False, "missing_label": ...}`` payload
+    WITHOUT calling ``issueUpdate`` — earlier versions silently forwarded the
+    raw string to Linear, which rejected the mutation and made the QA agent
+    fail a perfectly good ticket (PTD-168).
+
+    Callers that intentionally treat missing labels as decorative bookkeeping
+    (e.g. the QA agent's ``qa-backend-only`` / ``qa-frontend-only`` /
+    ``qa-fullstack`` scope tags) should check ``resolved`` and continue on
+    ``False`` rather than escalating to FAIL_ENVIRONMENT.
+    """
     # First, get current labels to avoid overwriting or to find ID by name
     query = """
     query IssueLabels($id: String!) {
@@ -308,27 +323,51 @@ def linear_add_label(ticket_id: str, label_id: str, task_id: str = None) -> str:
     }
     """
     info = _execute_linear_query(query, {"id": ticket_id})
-    if not info["success"]: return json.dumps(info)
-    
+    if not info["success"]:
+        return json.dumps({**info, "resolved": False, "missing_label": label_id})
+
     current_ids = [l["id"] for l in info["data"]["issue"]["labels"]["nodes"]]
     team_labels = info["data"]["issue"]["team"]["labels"]["nodes"]
-    
+
     # Resolve label_id if it's a name
-    target_id = label_id
+    target_id = None
     for l in team_labels:
         if l["name"].lower() == label_id.lower() or l["id"] == label_id:
             target_id = l["id"]
             break
-            
+
+    if target_id is None:
+        # Name did not match any team label — surface this clearly so the
+        # caller can decide whether to escalate or treat as decorative.
+        logger.warning(
+            "linear_add_label: label_id=%r did not match any label on the "
+            "ticket's team (tried %d team labels). Returning unresolved.",
+            label_id,
+            len(team_labels),
+        )
+        return json.dumps({
+            "success": False,
+            "resolved": False,
+            "missing_label": label_id,
+            "reason": "label_not_found_on_team",
+            "team_label_count": len(team_labels),
+        })
+
     if target_id not in current_ids:
         current_ids.append(target_id)
-        
+
     mutation = """
     mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
       issueUpdate(id: $id, input: $input) { success }
     }
     """
-    return json.dumps(_execute_linear_query(mutation, {"id": ticket_id, "input": {"labelIds": current_ids}}))
+    result = _execute_linear_query(mutation, {"id": ticket_id, "input": {"labelIds": current_ids}})
+    # Surface resolution status on the success path too — callers can confirm
+    # the label was actually applied (idempotent re-adds still report True).
+    if isinstance(result, dict) and result.get("success"):
+        result["resolved"] = True
+        result["applied_label_id"] = target_id
+    return json.dumps(result)
 
 def linear_post_comment(ticket_id: str, body: str, task_id: str = None) -> str:
     """Post a comment to a Linear ticket."""

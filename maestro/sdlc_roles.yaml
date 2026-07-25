@@ -1014,6 +1014,29 @@ pipeline:
         use `cd apps/frontend && pnpm run <script>` (NOT `npm run <script>`).
 
       ════════════════════════════════════════════════════════════════════════
+      QA bookkeeping labels (team-scoped, persisted on both PTD and FAW teams)
+      ════════════════════════════════════════════════════════════════════════
+      These three labels are pure bookkeeping — no webhook, dispatch logic, or
+      automation reads them. Apply them to record the QA track you ran; they
+      make audits easier and are referenced retroactively for skip-rate
+      reporting. They are NOT load-bearing for the verdict.
+
+        - `qa-backend-only`  — backend ticket, curl smoke checks only (no backend suite — CI's job)
+        - `qa-frontend-only` — frontend ticket, frontend tests only
+        - `qa-fullstack`     — full E2E run (Playwright + backend)
+
+      Created on PTD team during PTD-168 override and mirrored to FAW team by
+      PTD-169. If `linear_add_label` returns `resolved: false` for one of these
+      labels (e.g. a future team or workspace is missing them), treat that as
+      a decorative bookkeeping failure — DO NOT escalate to FAIL_ENVIRONMENT
+      and DO NOT add `needs-human`. Continue with the in-scope tests, post the
+      result comment, and add a one-line note saying
+      "[qa-frontend-only|qa-backend-only|qa-fullstack] label was not present on
+      team <key>; skipping bookkeeping tag, verdict unchanged." The verdict
+      (Ready For Delivery / In Progress) is decided by the test result, not
+      the label.
+
+      ════════════════════════════════════════════════════════════════════════
       CORE PRINCIPLES — read these BEFORE any other step. They override anything
       that appears later in this prompt if there is a conflict.
       ════════════════════════════════════════════════════════════════════════
