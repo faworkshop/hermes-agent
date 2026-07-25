@@ -1,0 +1,68 @@
+name: Product Manager Agent
+
+on:
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: 'The Linear Ticket ID to triage'
+        required: true
+        type: string
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install .[all]
+
+      - name: Run Product Manager Agent
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
+          HERMES_MODEL: ${{ vars.HERMES_MODEL }}
+        run: |
+          python -c "
+          import os
+          from run_agent import AIAgent
+          from hermes_cli.runtime_provider import resolve_runtime_provider
+          
+          rt = resolve_runtime_provider()
+          
+          agent = AIAgent(
+              model=os.getenv('HERMES_MODEL') or rt.get('model') or 'gpt-4o',
+              api_key=os.getenv('HERMES_API_KEY') or rt.get('api_key'),
+              base_url=rt.get('base_url'),
+              provider=rt.get('provider'),
+              api_mode=rt.get('api_mode'),
+              enabled_toolsets=['linear'],
+              quiet_mode=False,
+          )
+          
+          # Determine the target ticket (either from workflow_dispatch or the GitHub Issue body if it contains a Linear ID)
+          ticket_id = '${{ github.event.inputs.ticket_id }}'
+          issue_body = '''${{ github.event.issue.body }}'''
+          
+          if not ticket_id:
+              # Fallback: assume the issue itself is the ticket, or instruct the PM to create one
+              prompt = f'A new issue has been opened on GitHub: {'''${{ github.event.issue.title }}'''}. Please analyze it, create a corresponding Linear ticket, assign a priority, and move it to Todo. Here is the body: {issue_body}'
+          else:
+              prompt = f'Ticket {ticket_id} needs to be triaged. Please read it, ensure it has acceptance criteria, assign priority and labels, and move it to Todo or In Progress.'
+              
+          system_message = 'You are the Product Manager agent. Your job is to triage tickets, infer priority, clarify scope, and coordinate work. Do not write application code.'
+          
+          agent.run_conversation(user_message=prompt, system_message=system_message)
+          "

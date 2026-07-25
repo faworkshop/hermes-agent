@@ -2675,12 +2675,18 @@ class GatewayRunner:
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
+        if canonical == "dashboard":
+            return await self._handle_dashboard_command(event)
+
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "trigger":
+            return await self._handle_trigger_command(event)
+
         if canonical == "restart":
             return await self._handle_restart_command(event)
-        
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
         
@@ -4097,17 +4103,144 @@ class GatewayRunner:
         ]
         if title:
             lines.append(f"**Title:** {title}")
-        lines.extend([
-            f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Tokens:** {session_entry.total_tokens:,}",
-            f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
-            "",
-            f"**Connected Platforms:** {', '.join(connected_platforms)}",
-        ])
+        lines.extend(
+            [
+                f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
+                f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
+                f"**Tokens:** {session_entry.total_tokens:,}",
+                f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
+                "",
+                f"**Connected Platforms:** {', '.join(connected_platforms)}",
+            ]
+        )
 
         return "\n".join(lines)
-    
+
+    async def _handle_dashboard_command(self, event: MessageEvent) -> str:
+        """Handle /dashboard command — show all active agent locks and ticket statuses."""
+        from agent.concurrency import ConcurrencyManager
+        import time
+
+        # Gateway runs from ~/.hermes/hermes-agent/ but the pipeline state lives in
+        # the webhook server's DB at faworkshop/hermes-agent/agent_state.db
+        cm = ConcurrencyManager(db_path="/Users/maestro/faworkshop/hermes-agent/agent_state.db")
+        now = time.time()
+
+        # --- Running tasks (active in-flight agents) ---
+        import sqlite3
+        with sqlite3.connect(cm.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            running_rows = conn.execute(
+                """
+                SELECT ticket_id, role, started_at, attempts, session_id
+                FROM agent_tasks WHERE state = 'running'
+                ORDER BY started_at ASC
+                """,
+            ).fetchall()
+        running = [dict(r) for r in running_rows]
+
+        # --- Active locks ---
+        locks = cm.get_all_locks_with_age()
+
+        # --- Queued tasks (pending claim) ---
+        queued = cm.get_queued_tasks(limit=10)
+
+        # --- Recently finished ---
+        recent = cm.get_recent_finished_tasks(limit=8)
+
+        # --- Collect stale ticket IDs for resolution hints ---
+        stale_tickets = {tid for tid, _, _, age in locks if age > 1800}
+        queued_ticket_ids = {q["ticket_id"] for q in queued}
+
+        # ── Section 1: Running ─────────────────────────────────────────────────────
+        lines = ["📊 **Pipeline Dashboard**\n"]
+
+        if running:
+            lines.append(f"**Running** ({len(running)} active)")
+            for r in running:
+                tid = r["ticket_id"]
+                role = r["role"]
+                age = now - r["started_at"]
+                if age > 1200:
+                    lines.append(f"  🟡 `{tid}` [{role}] — {self._fmt_age(age)}")
+                else:
+                    lines.append(f"  ⚡ `{tid}` [{role}] — {self._fmt_age(age)}")
+            lines.append("")
+
+        # ── Section 2: Queued (pending claim) ──────────────────────────────────
+        if queued:
+            lines.append("**In Queue** (waiting for worker to claim)")
+            for q in queued:
+                tid = q["ticket_id"]
+                role = q["role"]
+                wait = now - q["created_at"]
+                wait_str = f"{wait/60:.1f}m ago" if wait < 3600 else f"{wait/3600:.1f}h ago"
+                retry = f"  retry={q['attempts']}" if q["attempts"] else ""
+                err = f"  ⚠️ {q['last_error'][:50]}" if q["last_error"] else ""
+                lines.append(f"  • `{tid}` [{role}]{retry} — queued {wait_str}{err}")
+            lines.append("")
+        else:
+            lines.append("**In Queue** — empty\n")
+
+        # ── Section 3: Active locks ────────────────────────────────────────────
+        if locks:
+            by_role: dict[str, list[tuple]] = {}
+            for tid, assignee, lat, age in locks:
+                by_role.setdefault(assignee, []).append((tid, lat, age))
+
+            for role, tickets in sorted(by_role.items()):
+                lines.append(f"**{role}** — {len(tickets)} active")
+                for tid, lat, age in tickets:
+                    if age > 1800:
+                        lines.append(
+                            f"  🔴 `{tid}` — {self._fmt_age(age)} ⚠️ STALE "
+                            f"(auto-expires 30m, needs /dashboard resolve)"
+                        )
+                    elif age > 1200:
+                        lines.append(f"  🟡 `{tid}` — {self._fmt_age(age)}")
+                    else:
+                        lines.append(f"  🔒 `{tid}` — {self._fmt_age(age)}")
+                lines.append("")
+        else:
+            lines.append("**Active Locks** — none\n")
+
+        # ── Section 4: Recently finished ───────────────────────────────────────
+        if recent:
+            lines.append("**Recently Done**")
+            for r in recent:
+                tid = r["ticket_id"]
+                role = r["role"]
+                state = r["state"]
+                ts = r["finished_at"]
+                elapsed = (r["finished_at"] - r["started_at"]) if r["started_at"] and r["finished_at"] else 0
+                when = self._fmt_age(now - ts) if ts else "?"
+                icon = "✅" if state == "done" else "❌" if state == "failed" else "⚪"
+                elapsed_str = f" ({elapsed/60:.1f}m)" if elapsed else ""
+                err_str = f" — {r['last_error'][:40]}" if r["last_error"] else ""
+                lines.append(f"  {icon} `{tid}` [{role}] {when}{elapsed_str}{err_str}")
+            lines.append("")
+
+        # ── Section 5: Stale resolution hint ──────────────────────────────────
+        if stale_tickets:
+            lines.append(
+                f"⚠️ **{len(stale_tickets)} stale lock(s) detected.** "
+                "Use `/trigger {role} {ticket}` to restart a crashed agent, "
+                "or manually move the Linear ticket to unblock."
+            )
+        else:
+            lines.append("All locks fresh. Pipeline healthy.")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_age(secs: float) -> str:
+        if secs < 120:
+            return f"{secs:.0f}s ago"
+        elif secs < 3600:
+            return f"{secs/60:.1f}m ago"
+        else:
+            return f"{secs/3600:.1f}h ago"
+
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
 
@@ -4178,6 +4311,59 @@ class GatewayRunner:
         if active_agents:
             return f"⏳ Draining {active_agents} active agent(s) before restart..."
         return "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
+
+    async def _handle_trigger_command(self, event: MessageEvent) -> str:
+        """Handle /trigger <role> <ticket-id> [prompt] — manually trigger an SDLC agent.
+
+        Calls POST /trigger-agent on the webhook server, which acquires a lock and
+        dispatches the appropriate AIAgent in the background without changing Linear state.
+        """
+        import requests as _requests
+
+        args = event.get_command_args().strip()
+        if not args:
+            return (
+                "Usage: `/trigger <role> <ticket-id> [prompt]`\n"
+                "Examples:\n"
+                "  `/trigger Developer FAW-26`\n"
+                "  `/trigger Reviewer FAW-26`\n"
+                "  `/trigger QA FAW-26 Review the PR after CI passes`\n"
+                "Roles: Developer, Reviewer, QA"
+            )
+
+        parts = args.split(None, 2)
+        role = parts[0] if len(parts) >= 1 else ""
+        ticket_id = parts[1] if len(parts) >= 2 else ""
+        prompt = parts[2] if len(parts) >= 3 else None
+
+        valid_roles = {"Developer", "Reviewer", "QA"}
+        if role not in valid_roles:
+            return f"Invalid role '{role}'. Must be one of: {', '.join(sorted(valid_roles))}"
+
+        if not ticket_id:
+            return "Usage: `/trigger <role> <ticket-id> [prompt]`"
+
+        webhook_url = os.environ.get("FAW_WEBHOOK_SERVER_URL", "http://localhost:8000")
+        try:
+            resp = _requests.post(
+                f"{webhook_url}/trigger-agent",
+                json={"role": role, "ticket_id": ticket_id, "prompt": prompt},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("status") == "accepted":
+                agent = data.get("agent", role)
+                ticket = data.get("ticket", ticket_id)
+                return f"✅ {agent} agent triggered for {ticket}. Check Linear for progress."
+            elif data.get("status") == "locked":
+                detail = data.get("detail", "another agent holds the lock")
+                return f"⚠️ Cannot trigger {role} for {ticket_id}: {detail}"
+            else:
+                return f"❌ Unexpected response: {data}"
+        except _requests.exceptions.ConnectionError:
+            return f"❌ Could not connect to webhook server at {webhook_url}. Is it running?"
+        except Exception as e:
+            return f"❌ Error: {e}"
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
@@ -5343,7 +5529,7 @@ class GatewayRunner:
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
             pr = self._provider_routing
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "150"))
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -7738,7 +7924,7 @@ class GatewayRunner:
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
             # Read from env var or use default (same as CLI)
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "150"))
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.

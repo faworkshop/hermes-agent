@@ -149,7 +149,29 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
-    
+
+    "linear": {
+        "description": "Linear issue tracking tools: read tickets, update status/priority, assign users, read/post comments",
+        "tools": [
+            "linear_read_ticket", "linear_read_comments", "linear_update_status",
+            "linear_update_priority", "linear_assign_user", "linear_add_label",
+            "linear_post_comment"
+        ],
+        "includes": []
+    },
+
+    "github": {
+        "description": "GitHub tools: create branches, open PRs, read diffs, resolve conflicts, assign PRs, leave review comments, add labels, get PR details/checks, approve, merge, and convert draft-to-open",
+        "tools": [
+            "github_create_branch", "github_open_pr", "github_read_diff",
+            "github_resolve_conflict", "github_assign_pr", "github_post_review_comment",
+            "github_add_label",
+            "github_get_pr", "github_get_pr_checks", "github_update_pr",
+            "github_merge_pr", "github_approve_pr"
+        ],
+        "includes": []
+    },
+
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, or OpenAI",
         "tools": ["text_to_speech"],

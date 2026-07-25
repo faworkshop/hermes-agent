@@ -122,7 +122,15 @@ DANGEROUS_PATTERNS = [
     # Git destructive operations that can lose uncommitted work or rewrite
     # shared history. Not captured by rm/chmod/etc patterns.
     (r'\bgit\s+reset\s+--hard\b', "git reset --hard (destroys uncommitted changes)"),
-    (r'\bgit\s+push\b.*--force\b', "git force push (rewrites remote history)"),
+    # `--force` alone clobbers remote without check. The safe variants
+    # `--force-with-lease` and `--force-if-includes` refuse to overwrite if
+    # the remote moved; they are the documented remediation for "develop
+    # moved on after I branched off" scenarios (e.g. FAW Workshop Developer
+    # rebasing onto a newer develop HEAD to clear `mergeable_state: dirty`).
+    # Allow them; flag only the bare unsafe form. The `(?!-)` lookahead
+    # forbids `--force-XYZ` while still matching `--force` followed by
+    # whitespace, EOL, or end-of-string.
+    (r'\bgit\s+push\b.*--force(?!-)', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
